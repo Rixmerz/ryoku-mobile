@@ -22,6 +22,28 @@ JSON, the same for any future transport:
   phone -> server  {"cmd": "zoom", "factor": 1..8, "x": 0..1, "y": 0..1}
                    zoom the PC's screen about that point of the viewed output (factor 1 = off)
   phone -> server  {"cmd": "key", "text": "abc"} or {"cmd": "key", "key": "Return", "mods": ["ctrl"]}
+  phone -> server  {"cmd": "open_url", "url": "https://youtu.be/<id>", "position_seconds": 77}
+                   (or the position as open_video gives it: position_ms, age_ms, speed, playing)
+                   open that YouTube video at that minute in the PC's default browser (see "Handing a
+                   video over"); answered to that phone alone with {"type": "open_url", "workspace": 7}
+                   or {"type": "open_url", "error": "..."}
+  phone -> server  {"cmd": "open_video", "title", "channel", "duration_ms", "position_ms", "age_ms", "speed", "playing"}
+                   the same hand-over for a phone that only knows what its media session reports: the bridge
+                   finds the video id by searching YouTube for title + channel (yt-dlp) and takes the result
+                   whose title, channel and length match; no confident match is an error, never a guess. The
+                   minute is position_ms moved on by age_ms * speed while playing. Answered like open_url.
+  phone -> server  {"cmd": "resolve_video", "title", "channel", "duration_ms"}
+                   the lookup alone, sent when the phone's video changes so a later open_video finds the id
+                   cached; not answered.
+
+  phone -> server  {"cmd": "volume", "step": 1 | -1}
+                   change the PC's default sink by 5 percentage points, never above 100%; answered to that
+                   phone alone with {"type": "volume", "level": 40, "muted": false} or {"type": "volume", "error": "..."}
+
+  phone -> server  {"cmd": "playpause"}
+                   toggles playback of the PC player window the phone's video was sent to: that window is
+                   focused, confirmed focused, and given YouTube's `k` key; nothing is typed anywhere else.
+                   Answered to that phone alone with {"type": "playpause"} or {"type": "playpause", "error": "..."}
 
 State is pushed on every Hyprland event (window opened, workspace switched, ...), read from
 Hyprland's event socket, so the phone updates as the desktop changes.
@@ -32,21 +54,31 @@ PC monitor is displaying is never moved: that monitor is mirrored instead. `VIDE
 H.264 Annex-B stream of whichever output the phone looks at (wf-recorder, one access unit per AUD
 NAL). The phone's input goes to a virtual pointer bound to that same output, so a workspace never
 disappears from the PC because the phone looks at it.
+Handing a video over. `open_url` opens a YouTube video the phone is playing in the PC's default browser, in a
+new window on the first workspace nothing uses, and switches the PC monitor there with the window focused. Only
+YouTube video links are accepted, and the address opened is built from the parsed video id and a whole number
+of seconds, never from the phone's text; the browser is started without a shell. The player window is
+made fullscreen once the page has loaded (see "Fullscreen" below the handoff code).
 Requires Hyprland configured through its Lua API (`hl.dsp`, `hl.monitor`), wf-recorder and wtype.
 """
 
 import asyncio
+import difflib
+import itertools
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
 
 PORT = int(os.environ.get("RYOKU_LINK_PORT", "7466"))
 VIDEO_PORT = int(os.environ.get("RYOKU_LINK_VIDEO_PORT", str(PORT + 1)))
@@ -178,6 +210,9 @@ def snapshot() -> dict:
             )
     return {
         "type": "state",
+        # What this bridge understands beyond the base protocol: a phone that wants one it lacks says so
+        # instead of waiting for an answer an older bridge never gives.
+        "features": ["open_url", "open_video", "volume", "playpause"],
         "host": socket.gethostname(),
         "viewing": viewing,
         "workspaces": [
@@ -460,7 +495,9 @@ class PhoneView:
         log("ryoku-monitor autoscale still running after 25 s; sizing the output anyway")
 
     def close(self) -> None:
-        self.reset_zoom()
+        # Unconditional: a zoom this view lost track of (a failed reset, an earlier run) must not outlive it.
+        self.zoomed_ws = None
+        set_zoom(1.0)
         if self.pointer:
             self.pointer.close()
             self.pointer = None
@@ -813,6 +850,560 @@ async def end_view() -> None:
     await broadcast()
 
 
+# ---- Handing a YouTube video over to the PC ----
+#
+# The phone sends the link of the video it is playing and the minute it is at; the bridge opens that
+# video in the PC's default browser, in a new window on a new empty workspace, and puts the PC there.
+# Nothing the phone sends is ever passed on as text: the link is parsed, its host and video id are
+# checked, and the address that is opened is built here from the id and a whole number of seconds
+# (watch_url). The browser is started from an argument list, never through a shell.
+#
+# The browser is the desktop's default (`xdg-settings get default-web-browser`): its .desktop file's Exec
+# line is run with --new-window added, which Chromium-based browsers and Firefox understand; a browser that
+# ignores it only opens a tab, and then no new window shows up and the handoff says so. Autoplay is the
+# browser's call: YouTube starts a watch page by itself, but a browser that blocks sound before the first
+# click on the site (Chromium's autoplay policy, for a profile that never played YouTube) leaves the
+# video paused on the PC until a click.
+
+VIDEO_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"})
+VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+MAX_SECONDS = 360_000  # 100 hours: longer than any video or live stream, short enough to be no free-form number
+LINK_PATHS = ("shorts", "live", "embed")  # youtube.com/<one of these>/<id>
+BROWSER_WINDOW_TIMEOUT = 15.0
+PLAYER_FILE = os.path.join(SOCKET_DIR, "player.json")
+FOCUS_TIMEOUT = 2.0
+FULLSCREEN_TIMEOUT = 1.5  # how long a fullscreen request gets to show in Hyprland before it is judged to have failed
+PAGE_SETTLE = 1.5  # YouTube's player takes keys a moment after its page has been navigated to
+DESKTOP_FILE = re.compile(r"[A-Za-z0-9._-]+\.desktop")
+WINDOW_ADDRESS = re.compile(r"0x[0-9a-f]{1,16}")
+PLAYER_URL = re.compile(r"https://www\.youtube\.com/watch\?v=[A-Za-z0-9_-]{11}&t=\d{1,6}s")
+FIELD_CODES = frozenset({"%u", "%U", "%f", "%F"})
+
+
+class HandoffError(Exception):
+    """A handoff that could not happen; the message is shown on the phone."""
+
+
+def parse_time(text: str) -> int | None:
+    """Seconds from a link's t= value: `77`, `77s` or `1h2m17s`; None when it is anything else."""
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?", text)
+    if not m or not any(m.groups()):
+        return None
+    hours, minutes, seconds = (int(g or 0) for g in m.groups())
+    total = hours * 3600 + minutes * 60 + seconds
+    return total if total <= MAX_SECONDS else None
+
+
+def parse_video_url(url) -> tuple[str, int | None] | None:
+    """(video id, seconds the link starts at or None) of a YouTube video link, None for anything else:
+    another host, another scheme, no video id or an id that is not 11 plain characters."""
+    if not isinstance(url, str) or len(url) > 2048:
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or host not in VIDEO_HOSTS or parts.username or parts.password or port not in (None, 80, 443):
+        return None
+    query = urllib.parse.parse_qs(parts.query)
+    path = [p for p in parts.path.split("/") if p]
+    if host == "youtu.be":
+        video_id = path[0] if len(path) == 1 else None
+    elif path == ["watch"]:
+        video_id = next(iter(query.get("v", [])), None)
+    elif len(path) == 2 and path[0] in LINK_PATHS:
+        video_id = path[1]
+    else:
+        video_id = None
+    if video_id is None or not VIDEO_ID.fullmatch(video_id):
+        return None
+    start = next(iter(query.get("t", []) or query.get("start", [])), None)
+    return video_id, parse_time(start) if start else None
+
+
+def watch_url(video_id: str, seconds: int) -> str:
+    """The address that is opened. Only a plain video id and whole seconds can get into it."""
+    if not VIDEO_ID.fullmatch(video_id) or not is_int(seconds) or not 0 <= seconds <= MAX_SECONDS:
+        raise ValueError("not a video id and a number of seconds")
+    return f"https://www.youtube.com/watch?v={video_id}&t={seconds}s"
+
+
+def handoff_target(msg: dict) -> str | None:
+    """The address to open for an `open_url` message, None when the message is not a YouTube video.
+    The minute is the phone's position_ms moved on to now (see playback_seconds) or its position_seconds; a
+    phone that cannot read it leaves it out and the link's own start time (or 0) is used."""
+    parsed = parse_video_url(msg.get("url"))
+    if parsed is None:
+        return None
+    video_id, from_link = parsed
+    seconds = playback_seconds(msg, MAX_SECONDS) if "position_ms" in msg else msg.get("position_seconds")
+    if seconds is None:
+        seconds = from_link or 0
+    if not is_int(seconds) or not 0 <= seconds <= MAX_SECONDS:
+        return None
+    return watch_url(video_id, seconds)
+
+
+# ---- Finding the video from what the phone's media session knows ----
+#
+# The phone reads the playing video's title, channel and length off its media session (fast, and nothing
+# is driven on screen) and the bridge searches YouTube for it. The id is only ever taken from a result whose
+# title, channel and duration all match: a wrong video on the PC is worse than a refusal. Results are
+# cached by title + channel + length, so sending the same video again does not search again.
+
+SEARCH_RESULTS = 5
+SEARCH_TIMEOUT = 15.0
+MAX_TEXT = 200
+DURATION_SLACK = 2  # seconds the media session's length and the search result's may differ by
+TITLE_SIMILARITY = 0.9
+CACHE_SIZE = 256
+MAX_SPEED = 16.0
+resolved_videos: dict[tuple[str, str, int], str] = {}
+resolve_lock = threading.Lock()  # a tap that arrives while the same video is being looked up waits for it, then hits the cache
+
+
+def normalize(text: str) -> str:
+    """Lowercase words only: the same title written with other punctuation, case or spacing compares equal."""
+    return " ".join(re.sub(r"[\W_]+", " ", text.casefold()).split())
+
+
+def clean_text(value) -> str | None:
+    """The phone's title or channel as plain one-line text, None when it is not a string or is empty."""
+    if not isinstance(value, str):
+        return None
+    text = " ".join("".join(ch if ch.isprintable() else " " for ch in value).split())[:MAX_TEXT]
+    return text or None
+
+
+def same_channel(a: str, b: str) -> bool:
+    """Equal, or one inside the other ("Rick Astley" and "Rick Astley - Topic")."""
+    a, b = normalize(a), normalize(b)
+    return bool(a and b) and (a == b or (min(len(a), len(b)) >= 3 and (a in b or b in a)))
+
+
+def pick_video(candidates: list[dict], title: str, channel: str | None, duration: int) -> str | None:
+    """The id of the search result that is this video, None when none is certain. A result must have the
+    same length (within DURATION_SLACK), a title that is the same or 90% alike, and the same channel; a phone
+    that reported no channel can only match a title that is exactly the same. Among those, the exact title,
+    then the exact channel, then the closest length, then the earlier result win."""
+    wanted, best, best_key = normalize(title), None, None
+    for position, c in enumerate(candidates):
+        video_id, length = c.get("id"), c.get("duration")
+        if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id) or not is_int(length):
+            continue
+        found = normalize(str(c.get("title") or ""))
+        exact = found == wanted
+        if abs(length - duration) > DURATION_SLACK or not (exact or difflib.SequenceMatcher(None, found, wanted).ratio() >= TITLE_SIMILARITY):
+            continue
+        if channel is None:
+            if not exact:
+                continue
+        elif not same_channel(str(c.get("channel") or c.get("uploader") or ""), channel):
+            continue
+        key = (exact, channel is not None and normalize(str(c.get("channel") or c.get("uploader") or "")) == normalize(channel),
+               -abs(length - duration), -position)
+        if best_key is None or key > best_key:
+            best, best_key = video_id, key
+    return best
+
+
+def search_youtube(query: str) -> list[dict]:
+    """Blocking: the first results of a YouTube search through yt-dlp, started from an argument list.
+    The query follows the `ytsearch5:` prefix, so it can never be read as an option."""
+    if not shutil.which("yt-dlp"):
+        raise HandoffError("yt-dlp is not installed on the computer")
+    argv = ["yt-dlp", "--ignore-config", "--flat-playlist", "--dump-json", "--no-warnings", f"ytsearch{SEARCH_RESULTS}:{query}"]
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=SEARCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise HandoffError("YouTube did not answer the search in time")
+    results = []
+    for line in done.stdout.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            results.append(entry)
+    if done.returncode != 0 and not results:
+        raise HandoffError("the YouTube search failed")
+    return results
+
+
+def resolve_video(title: str, channel: str | None, duration: int, search=None) -> str:
+    """Blocking: the video id for a title, channel and length in seconds. HandoffError when nothing matches."""
+    key = (normalize(title), normalize(channel or ""), duration)
+    with resolve_lock:
+        if key in resolved_videos:
+            return resolved_videos[key]
+        video_id = pick_video((search or search_youtube)(f"{title} {channel or ''}".strip()), title, channel, duration)
+        if video_id is None:
+            raise HandoffError("could not tell which video this is: use Share > Send to PC")
+        if len(resolved_videos) >= CACHE_SIZE:
+            del resolved_videos[next(iter(resolved_videos))]  # oldest first: dicts keep insertion order
+        resolved_videos[key] = video_id
+        return video_id
+
+
+def playback_seconds(msg: dict, duration: int) -> int | None:
+    """Whole seconds into the video at the moment the phone read its session: the reported position, moved on
+    by the time since that report times the speed while playing (a playing session reports it once, when it
+    started or seeked). None when the phone had no position; never beyond the video's own length."""
+    position, age, speed = msg.get("position_ms"), msg.get("age_ms", 0), msg.get("speed", 1)
+    limit = MAX_SECONDS * 1000
+    if not is_int(position) or not 0 <= position <= limit or not is_int(age) or not 0 <= age <= limit:
+        return None
+    if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not 0 < speed <= MAX_SPEED:
+        return None
+    moved = position + age * speed if msg.get("playing") is True else position
+    return min(int(moved // 1000), duration)
+
+
+def video_identity(msg: dict) -> tuple[str, str | None, int]:
+    """(title, channel, whole seconds long) of an `open_video` or `resolve_video` message. HandoffError when
+    the phone sent no usable title or length."""
+    title, channel = clean_text(msg.get("title")), clean_text(msg.get("channel"))
+    length = msg.get("duration_ms")
+    if title is None or not is_int(length) or not 1000 <= length <= MAX_SECONDS * 1000:
+        raise HandoffError("could not tell which video this is: use Share > Send to PC")
+    return title, channel, round(length / 1000)
+
+
+def video_target(msg: dict) -> str:
+    """Blocking: the address to open for an `open_video` message. HandoffError says what to show the person."""
+    title, channel, duration = video_identity(msg)
+    seconds = playback_seconds(msg, duration)
+    return watch_url(resolve_video(title, channel, duration), seconds or 0)
+
+
+def warm_video(msg: dict) -> None:
+    """Blocking: looks the video up ahead of the tap, so the tap finds it cached. The phone sends this when
+    YouTube starts a video; nothing is answered, a miss only means the tap searches instead."""
+    try:
+        resolve_video(*video_identity(msg))
+    except HandoffError as e:
+        log(f"resolve skipped: {e}")
+
+def browser_exec(desktop_text: str) -> list[str] | None:
+    """The Exec words of a .desktop file's main entry, None when it has none."""
+    in_entry = False
+    for line in desktop_text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            in_entry = line == "[Desktop Entry]"
+        elif in_entry and line.startswith("Exec="):
+            try:
+                return shlex.split(line[len("Exec="):])
+            except ValueError:
+                return None
+    return None
+
+
+def browser_argv(exec_words: list[str] | None, url: str) -> list[str]:
+    """The command that opens `url` in a new window of the browser whose Exec words are given.
+    Without Exec words, xdg-open: it opens a tab, which is better than nothing."""
+    if not exec_words:
+        return ["xdg-open", url]
+    argv, placed = [], False
+    for word in exec_words:
+        if word in FIELD_CODES:
+            if not placed:
+                argv += ["--new-window", url]
+                placed = True
+        elif not (len(word) == 2 and word[0] == "%"):  # %i, %c, %k: icon, name and path of the launcher
+            argv.append(word)
+    return argv if placed else argv + ["--new-window", url]
+
+
+def default_browser_desktop() -> str | None:
+    for command in (["xdg-settings", "get", "default-web-browser"], ["xdg-mime", "query", "default", "x-scheme-handler/https"]):
+        try:
+            name = subprocess.run(command, capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if DESKTOP_FILE.fullmatch(name):
+            return name
+    return None
+
+
+def read_desktop_file(name: str) -> str | None:
+    dirs = [os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")]
+    dirs += (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    for base in dirs:
+        try:
+            with open(os.path.join(base, "applications", name), encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            continue
+    return None
+
+
+def launch_browser(url: str) -> list[str]:
+    """Starts the default browser on `url` in a new window and returns the command used. Own systemd scope
+    when there is one: a browser started cold must not die with this service's restart."""
+    name = default_browser_desktop()
+    text = read_desktop_file(name) if name else None
+    argv = browser_argv(browser_exec(text) if text else None, url)
+    if shutil.which("systemd-run"):
+        argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", *argv]
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return argv
+
+
+def free_workspace(workspaces: list[dict], monitors: list[dict]) -> int:
+    """The lowest workspace id that has no windows and is shown on no monitor (the headless phone
+    output included), so a handoff never lands on something in use or on what the PC monitor shows."""
+    used = {w["id"] for w in workspaces if w.get("windows", 0) > 0}
+    used |= {m["activeWorkspace"]["id"] for m in monitors}
+    return next(i for i in itertools.count(1) if i not in used)
+
+
+def pc_monitor(monitors: list[dict]) -> dict | None:
+    """The focused PC monitor (the phone's headless output is not one), else the first."""
+    pc = [m for m in monitors if m["name"] != OUTPUT]
+    return next((m for m in pc if m.get("focused")), pc[0] if pc else None)
+
+
+def focus_window(address: str) -> str:
+    return f"hl.dsp.focus({{ window = {json.dumps('address:' + address)} }})"
+
+
+def move_window(address: str, workspace: int) -> str:
+    return f"hl.dsp.window.move({{ workspace = {int(workspace)}, window = {json.dumps('address:' + address)} }})"
+
+
+def new_window(before: set[str], clients: list[dict]) -> dict | None:
+    """The first window that was not there before, for the browser's new window."""
+    return next((c for c in clients if c["address"] not in before and c.get("mapped", True)), None)
+
+
+def show_steps(window: dict, workspace: int) -> list[str]:
+    """Dispatchers that leave the PC on `workspace` with `window` there and focused."""
+    moved = [] if window["workspace"]["id"] == workspace else [move_window(window["address"], workspace)]
+    return [*moved, focus_workspace(workspace), focus_window(window["address"])]
+
+
+def poll(read, timeout: float, interval: float = 0.3):
+    """The first truthy `read()` before the deadline, else None. Runs on a worker thread."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if value := read():
+            return value
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(interval)
+
+
+def open_on_new_workspace(url: str, on_window=None) -> int:
+    """Blocking: opens `url` in a new browser window on a free workspace, shows it and returns the
+    workspace. `on_window` gets the new window's address. HandoffError when the desktop or the browser would not."""
+    monitors = hyprctl("monitors") or []
+    monitor = pc_monitor(monitors)
+    if monitor is None:
+        raise HandoffError("the computer has no screen to show it on")
+    previous = monitor["activeWorkspace"]["id"]
+    workspace = free_workspace(hyprctl("workspaces") or [], monitors)
+    before = {c["address"] for c in hyprctl("clients") or []}
+    # Windows open on the focused workspace: go to the empty one first, so the browser's lands there.
+    if not dispatch(focus_monitor(monitor["name"]), focus_workspace(workspace)):
+        raise HandoffError("the desktop would not switch to a new workspace")
+    try:
+        argv = launch_browser(url)
+        log(f"handoff: {shlex.join(argv)}")
+    except OSError as e:
+        dispatch(focus_workspace(previous))
+        raise HandoffError(f"could not start the browser ({e.strerror or e})")
+    window = poll(lambda: new_window(before, hyprctl("clients") or []), BROWSER_WINDOW_TIMEOUT)
+    if window is None:
+        dispatch(focus_workspace(previous))
+        raise HandoffError("the browser opened no new window")
+    if on_window:
+        on_window(window["address"])
+    if not dispatch(*show_steps(window, workspace)):
+        log(f"handoff: could not show {window['address']} on workspace {workspace}")
+    return workspace
+
+
+def load_player() -> str | None:
+    """The address of the window that plays the phone's videos; kept in a file so a restart finds it."""
+    try:
+        with open(PLAYER_FILE, encoding="utf-8") as f:
+            address = json.load(f).get("address")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return address if isinstance(address, str) and WINDOW_ADDRESS.fullmatch(address) else None
+
+
+def save_player(address: str) -> None:
+    os.makedirs(os.path.dirname(PLAYER_FILE), mode=0o700, exist_ok=True)
+    tmp = PLAYER_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"address": address}, f)
+    os.replace(tmp, PLAYER_FILE)
+
+
+def focus_confirmed(address: str) -> bool:
+    """True once Hyprland reports `address` as the focused window."""
+    return poll(lambda: (hyprctl("activewindow") or {}).get("address") == address, FOCUS_TIMEOUT, 0.1) is True
+
+
+def navigate_argv(url: str) -> list[list[str]]:
+    """The wtype argument lists that replace the page of the focused browser window with `url`:
+    Ctrl+L, the address, Enter. Only a rebuilt watch address is accepted."""
+    if not PLAYER_URL.fullmatch(url):
+        raise ValueError("not a rebuilt watch address")
+    return [["wtype", "-M", "ctrl", "-k", "l", "-m", "ctrl"], ["wtype", "--", url], ["wtype", "-k", "Return"]]
+
+
+# ---- Fullscreen ----
+#
+# The player window ends every send fullscreen, so the video fills the monitor from across the room. YouTube's
+# `f` key does that: the page's player goes fullscreen and the browser asks Hyprland to make its window
+# fullscreen too, with no browser chrome left. Hyprland's own fullscreen alone would keep the page's masthead
+# and sidebar, so it is only the fallback when `f` does not take.
+# A re-send must not type into a fullscreen page: with the player fullscreen, Ctrl+L never reaches the address
+# bar and the address is typed into the page as YouTube shortcuts. So every send first takes the window out of
+# fullscreen (Hyprland's `unset` also ends the page's fullscreen), navigates, and then presses `f` once on a
+# page that has just loaded and is therefore never fullscreen already. `f` toggles, so it is only repeated
+# while the window still reads as not fullscreen.
+
+FULLSCREEN_KEY = ["wtype", "-k", "f"]
+
+
+def fullscreen_dispatch(address: str, action: str) -> str:
+    """The Hyprland dispatcher that sets or unsets fullscreen on the window at `address`."""
+    if action not in ("set", "unset"):
+        raise ValueError(f"not a fullscreen action: {action!r}")
+    return f"hl.dsp.window.fullscreen({{ mode = \"fullscreen\", action = \"{action}\", window = {json.dumps('address:' + address)} }})"
+
+
+def fullscreen_state(address: str) -> int | None:
+    """Hyprland's fullscreen state of the window (a bit set, see is_fullscreen), None when it is gone."""
+    return next((c.get("fullscreen", 0) for c in hyprctl("clients") or [] if c["address"] == address), None)
+
+
+def is_fullscreen(state: int | None) -> bool:
+    """Hyprland's state is a bit set: 1 maximized, 2 fullscreen. A maximized window is not fullscreen: its address
+    bar answers Ctrl+L, so it is neither left nor counted as done."""
+    return state is not None and bool(state & 2)
+
+
+def leave_fullscreen(address: str) -> bool:
+    """Blocking: takes the window out of fullscreen. True once it does not read as fullscreen; nothing is
+    dispatched when it already does not."""
+    if not is_fullscreen(fullscreen_state(address)):
+        return True
+    dispatch(fullscreen_dispatch(address, "unset"))
+    return poll(lambda: not is_fullscreen(fullscreen_state(address)), FULLSCREEN_TIMEOUT, 0.1) is True
+
+
+def enter_fullscreen(address: str) -> bool:
+    """Blocking: makes the video fill the monitor. Presses `f` on the focused player; a second time only
+    when the window still reads as not fullscreen after the first got its time; Hyprland's fullscreen as the
+    last resort. True when the window is fullscreen at the end."""
+    time.sleep(PAGE_SETTLE)
+    for attempt in range(2):
+        if not focus_confirmed(address):
+            log(f"fullscreen: focus left player {address}, nothing pressed")
+            return False
+        if attempt and is_fullscreen(fullscreen_state(address)):  # the first press took, late
+            return True
+        done = subprocess.run(FULLSCREEN_KEY, capture_output=True, text=True, timeout=5)
+        if done.returncode != 0:
+            log(f"fullscreen: wtype failed: {done.stderr.strip()}")
+            break
+        if poll(lambda: is_fullscreen(fullscreen_state(address)), FULLSCREEN_TIMEOUT, 0.1):
+            return True
+    state = fullscreen_state(address)
+    if state is not None and not is_fullscreen(state):
+        log(f"fullscreen: the page did not take `f`, using Hyprland's fullscreen on {address}")
+        dispatch(fullscreen_dispatch(address, "set"))
+    return is_fullscreen(fullscreen_state(address))
+
+
+def show_player(url: str) -> int | None:
+    """Blocking: shows the existing player window and loads `url` in it. The workspace, or None when
+    there is no player to reuse (gone, or focus could not be confirmed): nothing was typed then."""
+    address = load_player()
+    window = next((c for c in hyprctl("clients") or [] if c["address"] == address), None) if address else None
+    if window is None:
+        return None
+    monitor = pc_monitor(hyprctl("monitors") or [])
+    if monitor is None:
+        return None
+    workspace = window["workspace"]["id"]
+    dispatch(focus_monitor(monitor["name"]), focus_workspace(workspace), focus_window(address))
+    if not focus_confirmed(address):
+        log(f"handoff: focus did not reach player {address}")
+        return None
+    if not leave_fullscreen(address):
+        raise HandoffError("the player window would not leave fullscreen")
+    steps = navigate_argv(url)
+    for i, argv in enumerate(steps):
+        if i and not focus_confirmed(address):  # focus moved away mid-way: stop before typing elsewhere
+            now = hyprctl("activewindow") or {}
+            log(f"handoff: focus left player {address} for {now.get('address')} ({now.get('class')}: {str(now.get('title'))[:40]!r}) after step {i}")
+            return None
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        if done.returncode != 0:
+            raise HandoffError(f"wtype failed: {done.stderr.strip()}")
+        time.sleep(0.4 if i == 0 else 0.15)  # the address bar needs a moment to take focus: typed too soon, its first characters are lost
+    return workspace
+
+
+def open_player(url: str) -> int:
+    """Blocking: loads `url` in the one player window, making a new one (and remembering it) when
+    there is none, and leaves it fullscreen. Always the user's own running browser and profile."""
+    workspace = show_player(url)
+    if workspace is None:
+        workspace = open_on_new_workspace(url, save_player)
+    if address := load_player():
+        if not enter_fullscreen(address):
+            log(f"handoff: player {address} is not fullscreen")  # the video still opened: not a failed send
+    return workspace
+
+
+async def hand_over(writer: asyncio.StreamWriter, target: str) -> None:
+    async with handoff_lock:
+        try:
+            workspace = await asyncio.to_thread(open_player, target)
+        except HandoffError as e:
+            log(f"handoff failed: {e}")
+            await reply(writer, {"type": "open_url", "error": str(e)})
+            return
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"handoff failed: {e}")
+            await reply(writer, {"type": "open_url", "error": "could not reach the desktop"})
+            return
+    log(f"handoff: {target} on workspace {workspace}")
+    await reply(writer, {"type": "open_url", "workspace": workspace})
+
+
+async def open_url(writer: asyncio.StreamWriter, msg: dict) -> None:
+    target = handoff_target(msg)
+    if target is None:
+        log("handoff refused: not a YouTube video link")
+        await reply(writer, {"type": "open_url", "error": "not a YouTube video link"})
+        return
+    await hand_over(writer, target)
+
+
+async def open_video(writer: asyncio.StreamWriter, msg: dict) -> None:
+    started = time.monotonic()
+    try:
+        target = await asyncio.to_thread(video_target, msg)
+    except HandoffError as e:
+        log(f"handoff refused: {e}")
+        await reply(writer, {"type": "open_url", "error": str(e)})
+        return
+    log(f"handoff: video found in {time.monotonic() - started:.2f}s")
+    await hand_over(writer, target)
+
+
+handoff_lock = asyncio.Lock()  # the new window is found by diffing, so one handoff runs at a time
+
+
 async def handle_video(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     v = view
     if v is None or v.pointer is None:
@@ -830,6 +1421,112 @@ async def handle_video(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         writer.close()
 
 
+# ---- PC volume from the phone ----
+#
+# While a video the phone sent is playing here, the phone's volume buttons step the default sink by 5 points.
+# wpctl's own limit keeps it from going above 100%; the level that is answered is read back from it. wpctl is
+# called directly (not `ryoku-volume`, which allows 150% with audio boost): the phone never exceeds 100%.
+
+VOLUME_SINK = "@DEFAULT_AUDIO_SINK@"
+VOLUME_STEP = 5
+VOLUME_READING = re.compile(r"Volume: (\d+(?:\.\d+)?)( \[MUTED\])?")
+
+
+class VolumeError(Exception):
+    pass
+
+
+def volume_argv(step: int) -> list[str]:
+    if step not in (1, -1):
+        raise ValueError(f"not a volume step: {step!r}")
+    return ["wpctl", "set-volume", VOLUME_SINK, f"{VOLUME_STEP}%{'+' if step > 0 else '-'}", "-l", "1.0"]
+
+
+def parse_volume(text: str) -> tuple[int, bool] | None:
+    """(level in percent, muted) from `wpctl get-volume` output such as `Volume: 0.35 [MUTED]`."""
+    m = VOLUME_READING.fullmatch(text.strip())
+    return (round(float(m.group(1)) * 100), m.group(2) is not None) if m else None
+
+
+def run_wpctl(argv: list[str]) -> str:
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise VolumeError(f"could not run {argv[0]} ({getattr(e, 'strerror', None) or e})") from e
+    if done.returncode != 0:
+        raise VolumeError(f"{argv[0]} failed: {done.stderr.strip()}")
+    return done.stdout
+
+
+def change_volume(step: int) -> tuple[int, bool]:
+    """Blocking: steps the default sink and returns the level it is at now, in percent, and whether it is muted."""
+    run_wpctl(volume_argv(step))
+    reading = parse_volume(run_wpctl(["wpctl", "get-volume", VOLUME_SINK]))
+    if reading is None:
+        raise VolumeError("could not read the volume back")
+    return reading
+
+
+volume_lock = asyncio.Lock()  # steps are read-modify-write: a held button must not interleave them
+
+
+async def set_volume(writer: asyncio.StreamWriter, msg: dict) -> None:
+    step = msg.get("step")
+    if not is_int(step) or step not in (1, -1):
+        log("volume refused: not a step of 1 or -1")
+        await reply(writer, {"type": "volume", "error": "not a volume step"})
+        return
+    async with volume_lock:
+        try:
+            level, muted = await asyncio.to_thread(change_volume, step)
+        except VolumeError as e:
+            log(f"volume failed: {e}")
+            await reply(writer, {"type": "volume", "error": str(e)})
+            return
+    await reply(writer, {"type": "volume", "level": level, "muted": muted})
+
+
+# ---- Play/pause of the PC player ----
+#
+# The one player window (load_player) gets YouTube's `k` key, which toggles playback in fullscreen too. playerctl
+# is not used: the browser's MPRIS player is whichever tab last played, not necessarily the one the phone sent,
+# so only a key typed into the confirmed-focused player window is certain to reach the right video.
+
+PLAYPAUSE_KEY = ["wtype", "-k", "k"]
+
+
+class PlayerError(Exception):
+    pass
+
+
+def toggle_playback() -> None:
+    """Blocking: presses `k` in the player window. PlayerError (shown to the person) when the window is gone, focus
+    cannot be confirmed on it or the key could not be sent; nothing is typed then."""
+    address = load_player()
+    if address is None or not any(c["address"] == address for c in hyprctl("clients") or []):
+        raise PlayerError("the PC player window is gone")
+    dispatch(focus_window(address))
+    if not focus_confirmed(address):
+        raise PlayerError("could not focus the PC player")
+    try:
+        done = subprocess.run(PLAYPAUSE_KEY, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise PlayerError(f"could not run wtype ({getattr(e, 'strerror', None) or e})") from e
+    if done.returncode != 0:
+        raise PlayerError(f"wtype failed: {done.stderr.strip()}")
+
+
+async def play_pause(writer: asyncio.StreamWriter) -> None:
+    async with handoff_lock:  # never while a send is typing into the same window
+        try:
+            await asyncio.to_thread(toggle_playback)
+        except PlayerError as e:
+            log(f"playpause failed: {e}")
+            await reply(writer, {"type": "playpause", "error": str(e)})
+            return
+    await reply(writer, {"type": "playpause"})
+
+
 async def on_command(writer: asyncio.StreamWriter, msg: dict) -> None:
     cmd = msg.get("cmd")
     if cmd in ("view", "unview"):
@@ -845,6 +1542,16 @@ async def on_command(writer: asyncio.StreamWriter, msg: dict) -> None:
     elif cmd == "unview":
         if view is not None and view.owner is writer:
             await end_view()
+    elif cmd == "open_url":
+        await open_url(writer, msg)
+    elif cmd == "open_video":
+        await open_video(writer, msg)
+    elif cmd == "volume":
+        await set_volume(writer, msg)
+    elif cmd == "playpause":
+        await play_pause(writer)
+    elif cmd == "resolve_video":
+        await asyncio.to_thread(warm_video, msg)
     elif view is not None and view.owner is writer:
         if cmd == "pointer":
             view.pointer_event(msg)
@@ -963,6 +1670,7 @@ async def main() -> None:
     if any(m["name"] == OUTPUT for m in hyprctl("monitors") or []):
         log(f"removing stale output {OUTPUT} from a previous run")
         subprocess.run(["hyprctl", "output", "remove", OUTPUT], capture_output=True, timeout=3)
+    set_zoom(1.0)  # a zoom left by a run that died while the phone was pinching
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, stop.set)

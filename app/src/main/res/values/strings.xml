@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="cast_service_description">Shows a small Send to PC button over other apps. Tap it to open the YouTube video you are watching on your computer, at the same minute. It learns which app is in front and, when you tap the button, reads the video link from the YouTube share sheet. After a video is sent, it also takes the volume buttons to change the volume of the computer until you long-press the button or play YouTube on the phone again.</string>
+</resources>

@@ -22,6 +22,11 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <!-- The home screens, so the Send to PC button knows when it is on one. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+        </intent>
     </queries>
 
     <application
@@ -54,6 +59,36 @@
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
         </service>
+
+        <!-- "Send to PC": an accessibility service is the one thing that can draw a button over other
+             apps without the Ryoku app open, and it reports which app is in front. -->
+        <service
+            android:name=".CastService"
+            android:exported="false"
+            android:label="Ryoku: Send to PC"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/cast_service" />
+        </service>
+
+        <!-- "Send to PC" in every app's share sheet: YouTube's Share -> Send to PC delivers the video link. -->
+        <activity
+            android:name=".SendToPcActivity"
+            android:exported="true"
+            android:label="Send to PC"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
 
         <!-- Shizuku hands its binder to the app through this provider. -->
         <provider

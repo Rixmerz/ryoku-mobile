@@ -25,6 +25,12 @@ data class DesktopWindow(val cls: String, val title: String)
 /** [busy]: a PC monitor is showing it, so the live view mirrors that monitor instead of moving the desktop (see PhoneView in ryoku_link.py). */
 data class Workspace(val id: Int, val name: String, val active: Boolean, val busy: Boolean, val windows: List<DesktopWindow>)
 
+/** The computer's answer to [DesktopLink.openUrl]: the [workspace] the page opened on, or the [error] why it did not. */
+data class OpenUrlReply(val workspace: Int?, val error: String?)
+
+/** The computer's answer to [DesktopLink.volume]: the [level] it is at now in percent, or the [error] why it could not change. */
+data class VolumeReply(val level: Int?, val muted: Boolean, val error: String?)
+
 /** A live view the computer agreed to serve: the stream's size and the port its video is on. */
 data class LiveInfo(val workspace: Int, val width: Int, val height: Int, val port: Int)
 
@@ -48,6 +54,21 @@ class DesktopLink(private val port: Int = 7466) {
     var live by mutableStateOf<LiveInfo?>(null); private set
     /** True when the computer could not open the last view it was asked for. */
     var openFailed by mutableStateOf(false); private set
+    /** The computer's last answer to [openUrl]. */
+    var openUrlReply by mutableStateOf<OpenUrlReply?>(null); private set
+    /** False while connected to a bridge that predates `open_url` (it would never answer one); set before [connected]. */
+    var canOpenUrl by mutableStateOf(false); private set
+    /** Same for `open_video`, the request the button sends. */
+    var canOpenVideo by mutableStateOf(false); private set
+    /** Same for `volume`, the request the phone's volume buttons send during a PC session (see PcSession). */
+    var canSetVolume by mutableStateOf(false); private set
+    /** Called, on this link's reader thread, with every answer to [volume]. */
+    @Volatile var onVolume: ((VolumeReply) -> Unit)? = null
+
+    /** Same for `playpause`, the request the play/pause button sends during a PC session. */
+    var canPlayPause by mutableStateOf(false); private set
+    /** Called, on this link's reader thread, with the error of an [playPause] the computer could not do; null when it did. */
+    @Volatile var onPlayPause: ((String?) -> Unit)? = null
 
     private val io = Executors.newSingleThreadExecutor()
     private val sender = Executors.newSingleThreadExecutor()
@@ -66,6 +87,9 @@ class DesktopLink(private val port: Int = 7466) {
     fun stop() {
         running = false
         runCatching { socket?.close() }
+        // A link made for one request (see PcHandoff) must not leave its two threads behind.
+        io.shutdown()
+        sender.shutdown()
     }
 
     /** Switches the computer's own monitor; the live view never does that. */
@@ -76,6 +100,44 @@ class DesktopLink(private val port: Int = 7466) {
         openFailed = false
         send(JSONObject().put("cmd", "view").put("id", id).put("width", width).put("height", height))
     }
+
+    /**
+     * Asks the computer to open the video at [url] in its default browser, on a new workspace, at the minute
+     * [now] reports (null: whatever the link itself says). The computer validates everything and builds the
+     * address it opens; the answer lands in [openUrlReply].
+     */
+    fun openUrl(url: String, now: NowPlaying?) {
+        openUrlReply = null
+        val msg = JSONObject().put("cmd", "open_url").put("url", url)
+        if (now != null) putPosition(msg, now)
+        send(msg)
+    }
+
+    /**
+     * Asks the computer to find the video [now] describes (title, channel, length) on YouTube and open it at
+     * its minute, as [openUrl] does. The computer refuses when it cannot be sure which video it is.
+     */
+    fun openVideo(now: NowPlaying) {
+        openUrlReply = null
+        val msg = JSONObject().put("cmd", "open_video").put("title", now.title ?: "").put("channel", now.channel ?: "").put("duration_ms", now.durationMs)
+        putPosition(msg, now)
+        send(msg)
+    }
+
+    /** Tells the computer which video is playing so it can look it up before the button is pressed; not answered. */
+    fun resolveVideo(now: NowPlaying) =
+        send(JSONObject().put("cmd", "resolve_video").put("title", now.title ?: "").put("channel", now.channel ?: "").put("duration_ms", now.durationMs))
+
+    private fun putPosition(msg: JSONObject, now: NowPlaying) {
+        // Unknown stays absent: the computer must not read "no position" as the start of the video.
+        now.positionMs?.let { msg.put("position_ms", it).put("age_ms", now.ageMs).put("speed", now.speed.toDouble()).put("playing", now.playing) }
+    }
+
+    /** Steps the computer's volume by [step] (1 or -1, five points each); the answer goes to [onVolume]. */
+    fun volume(step: Int) = send(JSONObject().put("cmd", "volume").put("step", step))
+
+    /** Toggles playback of the player window the computer opened for the video; the answer goes to [onPlayPause]. */
+    fun playPause() = send(JSONObject().put("cmd", "playpause"))
 
     fun closeView() {
         live = null
@@ -206,6 +268,9 @@ class DesktopLink(private val port: Int = 7466) {
         when (o.optString("type")) {
             "state" -> parseState(o)
             "view" -> parseView(o)
+            "volume" -> onVolume?.invoke(VolumeReply(if (o.has("level")) o.getInt("level") else null, o.optBoolean("muted"), o.optString("error").ifEmpty { null }))
+            "playpause" -> onPlayPause?.invoke(o.optString("error").ifEmpty { null })
+            "open_url" -> openUrlReply = OpenUrlReply(if (o.has("workspace")) o.getInt("workspace") else null, o.optString("error").ifEmpty { null })
         }
     }
 
@@ -226,6 +291,11 @@ class DesktopLink(private val port: Int = 7466) {
                 List(wins?.length() ?: 0) { j -> wins!!.getJSONObject(j).let { DesktopWindow(it.optString("class"), it.optString("title")) } })
         }
         host = o.optString("host")
+        val features = o.optJSONArray("features")?.let { f -> List(f.length()) { f.optString(it) } } ?: emptyList()
+        canOpenUrl = "open_url" in features
+        canOpenVideo = "open_video" in features
+        canSetVolume = "volume" in features
+        canPlayPause = "playpause" in features
         connected = true
     }
 }
