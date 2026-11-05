@@ -55,7 +55,8 @@ import kotlin.math.abs
 /**
  * One desktop, live: the computer's headless output (pc/ryoku_link.py) as an H.264 stream on a
  * SurfaceView, with the touchscreen driving its pointer. Desktops are wide, so the screen turns
- * to landscape while this is open and the picture is letterboxed to the stream's own aspect;
+ * to landscape while this is open and the picture is letterboxed to the stream's own aspect (a
+ * desktop the PC monitor is showing is that monitor's picture, in the monitor's aspect);
  * touches are mapped onto the picture, never onto the bars.
  *
  * Gestures, chosen so none collides with another:
@@ -87,14 +88,6 @@ fun LiveView(link: DesktopLink, workspace: Int, onClose: () -> Unit) {
             }
         }
         LaunchedEffect(link.live?.workspace) { link.live?.workspace?.let { target = it } }
-        LaunchedEffect(link.refused) {
-            link.refused?.let {
-                hint = "Desktop $it is on the PC screen"
-                // The swipe optimistically moved `target`; the view stayed where it was.
-                link.live?.let { live -> target = live.workspace }
-            }
-            link.clearRefusal()
-        }
         LaunchedEffect(hint) { if (hint != null) { delay(1800); hint = null } }
 
         // Opening can take a while: the computer waits out its own display hotplug handling first.
@@ -105,10 +98,10 @@ fun LiveView(link: DesktopLink, workspace: Int, onClose: () -> Unit) {
                 key(info.port, info.width, info.height) { LiveSurface(info) }
                 Box(Modifier.fillMaxSize().pointerInput(info.width) {
                     desktopGestures(link, info.width) { step ->
-                        // Busy desktops (on the PC monitor) are skipped; the ends do not wrap.
-                        val free = link.workspaces.filter { !it.busy || it.id == target }
-                        val at = free.indexOfFirst { it.id == target }
-                        free.getOrNull(at + step)?.let {
+                        // A desktop on the PC monitor is viewed by mirroring that monitor; the ends do not wrap.
+                        val all = link.workspaces
+                        val at = all.indexOfFirst { it.id == target }
+                        all.getOrNull(at + step)?.let {
                             target = it.id
                             hint = "Desktop ${it.name}"
                             link.openView(it.id, widthPx, heightPx)

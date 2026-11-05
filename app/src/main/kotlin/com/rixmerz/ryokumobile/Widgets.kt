@@ -372,7 +372,7 @@ private fun DesktopPage(link: DesktopLink, onView: (Int) -> Unit) {
             Column(Modifier.fillMaxWidth().height(72.dp).clip(RoundedCornerShape(Geo.radius))
                 .background(if (w.active) T.bone else Color.Transparent)
                 .border(Geo.border, if (w.active) T.bone else T.line, RoundedCornerShape(Geo.radius))
-                .combinedClickable(onClick = { if (!w.busy) onView(w.id) }, onLongClick = { link.switchTo(w.id) })
+                .combinedClickable(onClick = { onView(w.id) }, onLongClick = { link.switchTo(w.id) })
                 .padding(Geo.s2).testTag("ws:${w.id}")) {
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(w.name, color = ink, fontFamily = Type.display, fontSize = 20.sp, lineHeight = Type.fValue)

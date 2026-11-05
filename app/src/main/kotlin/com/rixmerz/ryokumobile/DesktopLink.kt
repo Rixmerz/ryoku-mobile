@@ -12,7 +12,7 @@ import java.net.Socket
 import java.util.concurrent.Executors
 
 data class DesktopWindow(val cls: String, val title: String)
-/** [busy]: the PC monitor is showing it, so the live view cannot (see PhoneView in ryoku_link.py). */
+/** [busy]: a PC monitor is showing it, so the live view mirrors that monitor instead of moving the desktop (see PhoneView in ryoku_link.py). */
 data class Workspace(val id: Int, val name: String, val active: Boolean, val busy: Boolean, val windows: List<DesktopWindow>)
 
 /** A live view the computer agreed to serve: the stream's size and the port its video is on. */
@@ -29,8 +29,6 @@ class DesktopLink(private val port: Int = 7466) {
     var host by mutableStateOf(""); private set
     var workspaces by mutableStateOf<List<Workspace>>(emptyList()); private set
     var live by mutableStateOf<LiveInfo?>(null); private set
-    /** The workspace the computer last refused to show because its monitor is on it. */
-    var refused by mutableStateOf<Int?>(null); private set
     /** True when the computer could not open the last view it was asked for. */
     var openFailed by mutableStateOf(false); private set
 
@@ -63,8 +61,6 @@ class DesktopLink(private val port: Int = 7466) {
         live = null
         send(JSONObject().put("cmd", "unview"))
     }
-
-    fun clearRefusal() { refused = null }
 
     /** [x] and [y] are fractions of the view, so the computer never needs this screen's size. */
     fun pointer(action: String, x: Float, y: Float, button: String = "left") =
@@ -118,8 +114,6 @@ class DesktopLink(private val port: Int = 7466) {
     private fun parseView(o: JSONObject) {
         if (o.has("error")) {
             openFailed = true
-        } else if (o.optBoolean("busy")) {
-            refused = o.optInt("workspace")
         } else if (o.has("port")) {
             live = LiveInfo(o.getInt("workspace"), o.getInt("width"), o.getInt("height"), o.getInt("port"))
         }

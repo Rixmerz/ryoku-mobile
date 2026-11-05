@@ -10,7 +10,8 @@ JSON, the same for any future transport:
   server -> phone  {"type": "state", "host": "...", "workspaces": [{"id", "name", "active",
                     "busy", "windows": [{"class", "title"}]}], "viewing": <id or null>}
   server -> phone  {"type": "view", "workspace": 3, "width": 1920, "height": 864, "port": 7467}
-                   or {"type": "view", "workspace": 3, "busy": true} when the PC monitor shows it,
+                   (sent again, unasked, whenever what the phone should show changes: width/height
+                   and the stream's source follow what the PC does),
                    or {"type": "view", "workspace": 3, "error": "..."} when it could not be opened
   phone -> server  {"cmd": "workspace", "id": 3}            switch the PC monitor's workspace
   phone -> server  {"cmd": "view", "id": 3, "width": 1080, "height": 2400}
@@ -24,10 +25,11 @@ State is pushed on every Hyprland event (window opened, workspace switched, ...)
 Hyprland's event socket, so the phone updates as the desktop changes.
 
 Live view. `view` creates a landscape headless Hyprland output (the phone's aspect, or 1920x1080 where
-the desktop forces it, see PhoneView), shows the
-chosen workspace on it, and `VIDEO_PORT` then serves an H.264 Annex-B stream of that output
-alone (wf-recorder, one access unit per AUD NAL). The phone's input goes to a virtual pointer
-and a virtual keyboard bound to that output, so the physical monitor keeps its own workspace.
+the desktop forces it, see PhoneView). A workspace no PC monitor is displaying is shown on it; one a
+PC monitor is displaying is never moved: that monitor is mirrored instead. `VIDEO_PORT` serves an
+H.264 Annex-B stream of whichever output the phone looks at (wf-recorder, one access unit per AUD
+NAL). The phone's input goes to a virtual pointer bound to that same output, so a workspace never
+disappears from the PC because the phone looks at it.
 Requires Hyprland configured through its Lua API (`hl.dsp`, `hl.monitor`), wf-recorder and wtype.
 """
 
@@ -121,12 +123,22 @@ def is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
-def output_size(width: int, height: int) -> tuple[int, int]:
-    """The phone's screen as a landscape output (the app rotates to match, desktops are wide),
-    scaled to MAX_SIDE, with even sides because yuv420p needs them."""
-    width, height = max(width, height), min(width, height)
-    k = min(1.0, MAX_SIDE / width)
+def fit_size(width: int, height: int) -> tuple[int, int]:
+    """The size scaled so the long side is at most MAX_SIDE, with even sides because yuv420p needs them."""
+    k = min(1.0, MAX_SIDE / max(width, height))
     return max(2, round(width * k / 2) * 2), max(2, round(height * k / 2) * 2)
+
+
+def output_size(width: int, height: int) -> tuple[int, int]:
+    """The phone's screen as a landscape output (the app rotates to match, desktops are wide)."""
+    return fit_size(max(width, height), min(width, height))
+
+
+def mirror_target(ws: int, visible: dict[str, int]) -> str | None:
+    """The PC monitor displaying `ws`, or None when no PC monitor is. Hyprland shows a workspace
+    on one monitor only, so a displayed workspace is mirrored, never moved: moving it would make
+    it disappear from the PC. `visible` maps each PC monitor (not the headless output) to its workspace."""
+    return next((name for name, shown in visible.items() if shown == ws), None)
 
 
 def snapshot() -> dict:
@@ -137,7 +149,7 @@ def snapshot() -> dict:
     shown = {m["activeWorkspace"]["id"] for m in pc}
     focused = next((m for m in pc if m.get("focused")), pc[0] if pc else None)
     active = focused["activeWorkspace"]["id"] if focused else None
-    viewing = next((m["activeWorkspace"]["id"] for m in monitors if m["name"] == OUTPUT), None)
+    viewing = view.ws if view is not None else None
     by_ws: dict[int, list] = {}
     for c in hyprctl("clients") or []:
         if c.get("mapped", True) and not c.get("hidden", False):
@@ -347,27 +359,32 @@ class VirtualPointer:
 class PhoneView:
     """The headless output standing in for the phone's screen, and everything to undo with it.
 
-    One workspace is visible on it at a time. Hyprland cannot show one workspace on two outputs,
-    so a workspace the PC monitor is displaying is *busy*: the phone is refused instead of the PC
-    monitor being switched away from what its user is looking at (the phone's swipe skips busy
-    desktops; it can view them once the PC monitor moves on). Every other workspace is pulled onto
-    the headless output and handed back to its home monitor when the phone moves on, so the
-    PC's own workspace shortcuts never land on an output nobody can see. While it is displayed
-    here a workspace is still the PC's: PC windows and keybinds can reach it.
+    Viewing a workspace must never make it disappear from the PC, and Hyprland cannot show one
+    workspace on two outputs. So a workspace a PC monitor is displaying stays where it is and the
+    phone *mirrors* that monitor (`mirror`): the stream records it and the phone's input is bound
+    to it. Every other workspace is pulled onto the headless output and handed back to its home
+    monitor when the phone moves on, so the PC's own workspace shortcuts never land on an output
+    nobody can see. While it is displayed here a workspace is still the PC's: PC windows and
+    keybinds can reach it. `apply` re-checks all of this and is also run when the PC moves.
 
-    Hyprland has one seat, so phone input moves the PC's cursor and keyboard focus onto the
-    headless output. They are handed back after REST_AFTER seconds of silence, unless the PC's
-    own mouse already took the cursor off the output.
+    On the headless output, Hyprland has one seat, so phone input moves the PC's cursor and
+    keyboard focus onto it. They are handed back after REST_AFTER seconds of silence, unless the
+    PC's own mouse already took the cursor off the output. A mirrored monitor needs no borrowing.
     """
 
     def __init__(self, owner: asyncio.StreamWriter, width: int, height: int):
         self.owner = owner
         self.width, self.height = output_size(width, height)
+        self.ws: int | None = None  # the workspace the phone asked for
+        self.mirror: str | None = None  # the PC monitor being mirrored; None: the headless output
+        self.mirror_size = (self.width, self.height)
+        self.mirror_native = self.mirror_size  # the mirrored monitor's own pixels
         self.pointer: VirtualPointer | None = None
+        self.pointer_on = OUTPUT
         self.stream: asyncio.Task | None = None
         self.watcher: asyncio.Task | None = None
-        # workspace -> (home monitor, workspace that monitor was showing) for those pulled here
-        self.pulled: dict[int, tuple[str, int]] = {}
+        # workspace -> the monitor it was pulled from, for those shown on the headless output
+        self.pulled: dict[int, str] = {}
         # (monitor focused, cursor x, y) before the phone took the seat; None when not borrowed
         self.rest: tuple[str, float | None, float | None] | None = None
         self.pressed: set[str] = set()
@@ -485,10 +502,12 @@ class PhoneView:
         return [move_current_workspace(monitor), focus_monitor(monitor), focus_workspace(was), focus_monitor(OUTPUT)]
 
     def _hand_back_steps(self, current: int, visible: dict[str, int]) -> list[str]:
+        # What the home monitor shows *now* is restored, not what it showed when the workspace was
+        # pulled: the PC may have moved on since, and it must not be switched away again.
         home = self.pulled.pop(current, None)
-        if home is None or home[0] not in visible:
+        if home is None or home not in visible:
             return []
-        return self._send_home(*home)
+        return self._send_home(home, visible[home])
 
     def reclaim_strays(self) -> None:
         """Hyprland parks some hidden workspaces on a freshly created output. Left there they would swallow the PC's own
@@ -509,25 +528,64 @@ class PhoneView:
             steps += [focus_workspace(ws, on_current_monitor=True), *self._send_home(home, visible[home])]
         dispatch(*steps, *self._give_back())
 
-    def show(self, ws: int) -> bool:
-        """Shows `ws` on the headless output. False when the PC monitor is displaying it."""
+    def look(self) -> tuple[str | None, int, int]:
+        """What the phone should be shown: the mirrored monitor (None: headless) and the stream size."""
+        return (self.mirror, *(self.mirror_size if self.mirror else (self.width, self.height)))
+
+    @property
+    def source(self) -> str:
+        return self.mirror or OUTPUT
+
+    def apply(self, from_pc: bool = False) -> bool:
+        """Makes the desktop match what the phone asked for (`ws`); True when what the phone should
+        be shown changed. Idempotent, so it can run after every Hyprland event without looping.
+        `from_pc`: the PC moved by itself (not the phone), see the takeover below."""
         mons = hyprctl("monitors") or []
         phone = next((m for m in mons if m["name"] == OUTPUT), None)
         if phone is None:
             raise RuntimeError("the headless output is gone")
-        visible = {m["name"]: m["activeWorkspace"]["id"] for m in mons if m["name"] != OUTPUT}
-        if ws in visible.values():
+        real = {m["name"]: m for m in mons if m["name"] != OUTPUT}
+        visible = {n: m["activeWorkspace"]["id"] for n, m in real.items()}
+        if not visible or self.ws is None:
             return False
-        current = phone["activeWorkspace"]["id"]
-        if current == ws:
-            return True
-        homes = {w["id"]: w["monitor"] for w in hyprctl("workspaces") or []}
-        self.remember_pc()
-        steps = [focus_monitor(OUTPUT), *self._hand_back_steps(current, visible)]
-        if homes.get(ws) in visible:
-            self.pulled[ws] = (homes[ws], visible[homes[ws]])
-        steps.append(focus_workspace(ws, on_current_monitor=True))
-        return dispatch(*steps, *self._give_back())
+        before, ws, current = self.look(), self.ws, phone["activeWorkspace"]["id"]
+        target = mirror_target(ws, visible)
+        if target is None and ws == current:
+            # Switching the PC to a workspace the headless output holds only focuses that output,
+            # where nobody can see it (and the phone is not borrowing the seat: `rest` is None).
+            # Hand it to its home monitor and mirror that.
+            if from_pc and phone.get("focused") and self.rest is None:
+                target = self.pulled.pop(ws, None)
+                if target not in visible:
+                    target = next(iter(visible))
+                dispatch(focus_monitor(OUTPUT), move_current_workspace(target), focus_monitor(target))
+        elif target is not None:
+            # The PC is displaying it: leave it alone. Whatever the headless output held goes home.
+            steps = self._hand_back_steps(current, visible)
+            if steps:
+                self.remember_pc()
+                dispatch(focus_monitor(OUTPUT), *steps, *self._give_back())
+            elif self.rest is not None:
+                dispatch(*self._give_back())
+        else:
+            homes = {w["id"]: w["monitor"] for w in hyprctl("workspaces") or []}
+            self.remember_pc()
+            steps = [focus_monitor(OUTPUT), *self._hand_back_steps(current, visible)]
+            if homes.get(ws) in visible:
+                self.pulled[ws] = homes[ws]
+            steps.append(focus_workspace(ws, on_current_monitor=True))
+            if not dispatch(*steps, *self._give_back()):
+                raise RuntimeError(f"could not show workspace {ws} on the headless output")
+        self.mirror = target
+        if target:
+            self.mirror_native = (real[target]["width"], real[target]["height"])
+            self.mirror_size = fit_size(*self.mirror_native)
+        if self.pointer_on != self.source and self.pointer is not None:
+            fresh = VirtualPointer(self.source)
+            old, self.pointer, self.pointer_on = self.pointer, fresh, self.source
+            self.pressed.clear()
+            old.close()
+        return self.look() != before
 
     def release(self) -> None:
         """Returns the workspace the phone is looking at to its home monitor."""
@@ -546,7 +604,8 @@ class PhoneView:
 
     def _touch(self) -> None:
         self.last_input = time.monotonic()
-        self.remember_pc()
+        if self.mirror is None:  # a mirrored PC monitor already has the seat
+            self.remember_pc()
 
     def pointer_event(self, msg: dict) -> None:
         action, x, y, button = msg.get("action"), msg.get("x"), msg.get("y"), msg.get("button", "left")
@@ -582,7 +641,7 @@ class PhoneView:
             return
         self._touch()
         # The seat's keyboard focus may have gone back to the PC (or the PC's mouse took it).
-        dispatch(focus_monitor(OUTPUT))
+        dispatch(focus_monitor(self.source))
         done = subprocess.run(["wtype", *argv], capture_output=True, text=True, timeout=3)
         if done.returncode != 0:
             log(f"wtype failed ({done.returncode}): {done.stderr.strip()}")
@@ -590,9 +649,12 @@ class PhoneView:
     # ---- video ----
 
     async def stream_to(self, writer: asyncio.StreamWriter) -> None:
-        """Pipes wf-recorder's H.264 for the headless output alone to the phone's video socket."""
+        """Pipes wf-recorder's H.264 for the output the phone looks at (alone) to the phone's video socket."""
+        source, (width, height) = self.source, self.look()[1:]
+        # A mirrored monitor larger than MAX_SIDE is scaled down to the size the phone was told.
+        scale = ["-F", f"scale={width}:{height},format=yuv420p"] if self.mirror and self.mirror_native != (width, height) else []
         proc = await asyncio.create_subprocess_exec(
-            "wf-recorder", "-o", OUTPUT, "-y", "-r", str(FPS),
+            "wf-recorder", "-o", source, *scale, "-y", "-r", str(FPS),
             # Constant frame rate (no damage tracking): the phone finds the end of a frame when the
             # next one starts, so a still desktop must keep producing frames.
             "-D", "-c", "libx264", "-x", "yuv420p", "-p", "preset=ultrafast", "-p", "tune=zerolatency",
@@ -622,16 +684,21 @@ view: PhoneView | None = None
 view_lock = asyncio.Lock()
 
 
+async def announce(v: PhoneView, changed: bool) -> None:
+    """Tells the phone what to show. A new source needs a new encoder: dropping the video
+    connection makes the phone reconnect (it retries every second) and get the right one."""
+    if changed and v.stream:
+        v.stream.cancel()
+    width, height = v.look()[1:]
+    await reply(v.owner, {"type": "view", "workspace": v.ws, "width": width, "height": height, "port": VIDEO_PORT})
+
+
 async def start_view(writer: asyncio.StreamWriter, ws: int, width: int, height: int) -> None:
     global view
     async with view_lock:
         if view is not None and view.owner is not writer:
             await _end_view()  # the newest phone wins
         if view is None:
-            busy = await asyncio.to_thread(lambda: any(m["activeWorkspace"]["id"] == ws for m in hyprctl("monitors") or []))
-            if busy:
-                await reply(writer, {"type": "view", "workspace": ws, "busy": True})
-                return
             candidate = PhoneView(writer, width, height)
             try:
                 await asyncio.to_thread(candidate.open)
@@ -642,12 +709,43 @@ async def start_view(writer: asyncio.StreamWriter, ws: int, width: int, height: 
             candidate.watcher = asyncio.create_task(candidate.rest_watcher())
             view = candidate
             log(f"live view opened: {candidate.width}x{candidate.height}")
-        shown = await asyncio.to_thread(view.show, ws)
-        if shown:
-            await reply(writer, {"type": "view", "workspace": ws, "width": view.width, "height": view.height, "port": VIDEO_PORT})
-        else:
-            await reply(writer, {"type": "view", "workspace": ws, "busy": True})
+        view.ws = ws
+        changed = await asyncio.to_thread(view.apply)
+        log(f"viewing workspace {ws} via {view.source}")
+        await announce(view, changed)
     await broadcast()
+
+
+follow_pending = False
+follow_task: asyncio.Task | None = None
+
+
+def follow_pc_soon() -> None:
+    """Re-checks the view after the PC moved by itself; at most one check runs, and events that
+    arrive meanwhile only ask for another pass (the check reads the state afresh)."""
+    global follow_pending, follow_task
+    if view is None:
+        return
+    follow_pending = True
+    if follow_task is None or follow_task.done():
+        follow_task = asyncio.create_task(follow_pc())
+
+
+async def follow_pc() -> None:
+    global follow_pending
+    while follow_pending:
+        follow_pending = False
+        async with view_lock:
+            v = view
+            if v is None:
+                return
+            try:
+                changed = await asyncio.to_thread(v.apply, True)
+                if changed:
+                    log(f"PC moved: workspace {v.ws} now via {v.source}")
+                    await announce(v, True)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+                log(f"could not follow the PC: {e}")
 
 
 async def _end_view() -> None:
@@ -747,6 +845,7 @@ async def watch_hyprland() -> None:
                 # Coalesce: one window move can emit several events within a few milliseconds.
                 await asyncio.sleep(0.05)
                 await broadcast()
+                follow_pc_soon()
         except (OSError, ConnectionError) as e:
             log(f"Hyprland event socket unavailable ({e}); retrying")
             await asyncio.sleep(3)
