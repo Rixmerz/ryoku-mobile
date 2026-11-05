@@ -22,6 +22,10 @@ JSON, the same for any future transport:
   phone -> server  {"cmd": "zoom", "factor": 1..8, "x": 0..1, "y": 0..1}
                    zoom the PC's screen about that point of the viewed output (factor 1 = off)
   phone -> server  {"cmd": "key", "text": "abc"} or {"cmd": "key", "key": "Return", "mods": ["ctrl"]}
+  phone -> server  {"cmd": "cast", "package": "com.google.android.youtube"}
+                   send the app in front on the phone to a new PC workspace (see "Casting");
+                   answered to that phone alone with {"type": "cast", "package": ..., "workspace": 7}
+                   or {"type": "cast", "package": ..., "error": "..."}
 
 State is pushed on every Hyprland event (window opened, workspace switched, ...), read from
 Hyprland's event socket, so the phone updates as the desktop changes.
@@ -32,14 +36,20 @@ PC monitor is displaying is never moved: that monitor is mirrored instead. `VIDE
 H.264 Annex-B stream of whichever output the phone looks at (wf-recorder, one access unit per AUD
 NAL). The phone's input goes to a virtual pointer bound to that same output, so a workspace never
 disappears from the PC because the phone looks at it.
+Casting. `cast` moves a running phone app onto an Android virtual display that scrcpy mirrors in a window
+on the first PC workspace nothing uses, placed there without switching the PC monitor or taking its focus.
+The app keeps its state (`am display move-stack` moves the existing task; launching it on the display
+would start a second task instead). Closing the window ends the cast. Needs scrcpy and adb on the PC.
 Requires Hyprland configured through its Lua API (`hl.dsp`, `hl.monitor`), wf-recorder and wtype.
 """
 
 import asyncio
+import itertools
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -58,6 +68,9 @@ ADB = os.environ.get("RYOKU_ADB") or (
     if os.path.exists(os.path.expanduser("~/Android/platform-tools/adb"))
     else shutil.which("adb") or "adb"
 )
+
+# scrcpy mirrors a phone app on the PC (see "Casting"); None while it is not installed.
+SCRCPY = os.environ.get("RYOKU_SCRCPY") or shutil.which("scrcpy")
 
 # The headless output the phone looks through. Fixed name: a stale one left by a crash is
 # found and removed at startup.
@@ -813,6 +826,189 @@ async def end_view() -> None:
     await broadcast()
 
 
+# ---- Casting a phone app to the PC ----
+#
+# scrcpy creates an Android virtual display and mirrors it in a window; the app is then moved onto
+# that display with `am display move-stack`, which keeps its task and so what it was doing (a playing
+# video keeps playing). Starting the app on the display instead, as scrcpy's --start-app does, makes
+# a second task and loses that state. Audio: --audio-source=playback sends the apps' audio to the PC
+# (Android 13+); it stays off the phone's speaker, and apps that opt out of capture stay silent.
+# Closing the window ends the virtual display; --no-vd-destroy-content, when this scrcpy has it, makes
+# Android move the app back to the phone instead of closing it.
+
+CAST_DISPLAY = "1920x1080/240"
+CAST_SETUP_TIMEOUT = 25.0
+# What an installed Android package name looks like: dotted identifiers, never a shell string.
+PACKAGE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+")
+OWN_PACKAGE = "com.rixmerz.ryokumobile"
+KEEP_APPS_FLAG = "--no-vd-destroy-content"
+
+
+class CastError(Exception):
+    """A cast that could not start; the message is shown on the phone."""
+
+
+class Cast:
+    def __init__(self, package: str, workspace: int, address: str, display: int):
+        self.package, self.workspace, self.address, self.display = package, workspace, address, display
+
+
+def valid_package(value) -> bool:
+    return isinstance(value, str) and len(value) <= 255 and value != OWN_PACKAGE and PACKAGE_PATTERN.fullmatch(value) is not None
+
+
+def free_workspace(workspaces: list[dict], monitors: list[dict]) -> int:
+    """The lowest workspace id that has no windows and is shown on no monitor (the headless phone
+    output included), so a cast never lands on something in use or on what the PC monitor shows."""
+    used = {w["id"] for w in workspaces if w.get("windows", 0) > 0}
+    used |= {m["activeWorkspace"]["id"] for m in monitors}
+    return next(i for i in itertools.count(1) if i not in used)
+
+
+def parse_stack_list(text: str) -> list[tuple[int, int, str]]:
+    """(root task id, display id, package) for every task in `am stack list`."""
+    found, root = [], None
+    for line in text.splitlines():
+        if m := re.match(r"RootTask id=(\d+) .*\bdisplayId=(\d+)", line):
+            root = (int(m[1]), int(m[2]))
+        elif root and (m := re.match(r"\s+taskId=\d+: ([^/\s]+)/", line)):
+            found.append((root[0], root[1], m[1]))
+    return found
+
+
+def find_root_task(stack_list: str, package: str, display: int = 0) -> int | None:
+    """The root task of `package` on `display`; `am stack list` puts the front-most first."""
+    return next((root for root, shown_on, pkg in parse_stack_list(stack_list) if pkg == package and shown_on == display), None)
+
+
+def parse_displays(dumpsys_display: str) -> dict[int, str]:
+    """Display id -> type (INTERNAL, VIRTUAL, OVERLAY, ...) from `dumpsys display`."""
+    return {int(m[1]): m[2] for m in re.finditer(r'mBaseDisplayInfo=DisplayInfo\{"[^"]*", displayId (\d+),.*?\btype (\w+),', dumpsys_display)}
+
+
+def new_display(before: dict[int, str], after: dict[int, str]) -> int | None:
+    """The display that appeared between two listings, preferring a virtual one."""
+    fresh = sorted(i for i in after if i not in before)
+    return next((i for i in fresh if after[i] == "VIRTUAL"), fresh[0] if fresh else None)
+
+
+def cast_title(package: str) -> str:
+    return f"ryoku-cast {package}"
+
+
+def scrcpy_argv(scrcpy: str, serial: str, title: str, keep_apps: bool) -> list[str]:
+    argv = [scrcpy, "-s", serial, f"--new-display={CAST_DISPLAY}", "--audio-source=playback", f"--window-title={title}"]
+    return argv + [KEEP_APPS_FLAG] if keep_apps else argv
+
+
+def exec_in_workspace(argv: list[str], workspace: int, log_path: str) -> str:
+    """Lua dispatcher that runs `argv` on `workspace` without switching to it or taking focus.
+    Hyprland runs the command through a shell, so every word is quoted; its output goes to a log."""
+    command = f"env ADB={shlex.quote(ADB)} {shlex.join(argv)} >{shlex.quote(log_path)} 2>&1"
+    return f"hl.dsp.exec_cmd({json.dumps(command, ensure_ascii=False)}, {{ workspace = \"{int(workspace)} silent\" }})"
+
+
+def adb(serial: str, *args: str, timeout: float = 8) -> str:
+    # `adb shell` joins its words into one remote shell line: callers pass validated names and integers only.
+    return subprocess.run([ADB, "-s", serial, *args], capture_output=True, text=True, timeout=timeout).stdout
+
+
+def poll(read, timeout: float, interval: float = 0.4):
+    """The first truthy `read()` before the deadline, else None. Runs on a worker thread."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if value := read():
+            return value
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(interval)
+
+
+def window_titled(title: str) -> dict | None:
+    return next((c for c in hyprctl("clients") or [] if c.get("title") == title), None)
+
+
+def launch_cast(package: str) -> Cast:
+    """Blocking: opens the scrcpy window and moves the app onto its display."""
+    if not SCRCPY:
+        raise CastError("scrcpy is not installed on the computer")
+    help_text = subprocess.run([SCRCPY, "--help"], capture_output=True, text=True, timeout=5)
+    help_text = help_text.stdout + help_text.stderr
+    if "--new-display" not in help_text:
+        raise CastError("this scrcpy is too old: it has no virtual display")
+    # USB serials first: a TCP one (Wi-Fi) only works when adb was already connected over the network.
+    serials = sorted(reverse_targets(), key=lambda s: ":" in s or s.startswith("adb-"))
+    if not serials:
+        raise CastError("no phone on adb: plug the cable in, or adb connect over Wi-Fi")
+    serial = serials[0]
+    if not adb(serial, "shell", "pm", "path", package).startswith("package:"):
+        raise CastError("that app is not installed on the phone")
+    root = find_root_task(adb(serial, "shell", "am", "stack", "list"), package)
+    if root is None:
+        raise CastError("that app is not running on the phone")
+    before = parse_displays(adb(serial, "shell", "dumpsys", "display"))
+    workspace = free_workspace(hyprctl("workspaces") or [], hyprctl("monitors") or [])
+    title = cast_title(package)
+    log_path = os.path.join(SOCKET_DIR, f"cast-{package}.log")
+    argv = scrcpy_argv(SCRCPY, serial, title, KEEP_APPS_FLAG in help_text)
+    if KEEP_APPS_FLAG not in help_text:
+        log(f"this scrcpy lacks {KEEP_APPS_FLAG}: closing the window will close {package} instead of returning it to the phone")
+    if not dispatch(exec_in_workspace(argv, workspace, log_path)):
+        raise CastError("the desktop refused to start scrcpy")
+    window = None
+    try:
+        display = poll(lambda: new_display(before, parse_displays(adb(serial, "shell", "dumpsys", "display"))), CAST_SETUP_TIMEOUT)
+        if display is None:
+            raise CastError("scrcpy did not create a virtual display")
+        adb(serial, "shell", "am", "display", "move-stack", str(root), str(display))
+        if find_root_task(adb(serial, "shell", "am", "stack", "list"), package, display) is None:
+            raise CastError("Android would not move the app to the virtual display")
+        window = poll(lambda: window_titled(title), CAST_SETUP_TIMEOUT)
+        if window is None:
+            raise CastError("scrcpy opened no window")
+    except CastError:
+        try:
+            with open(log_path) as f:
+                log(f"scrcpy output: {f.read()[-400:].strip()}")
+        except OSError:
+            pass  # no log: scrcpy never started, the error above says why
+        if (w := window_titled(title)) and w.get("pid"):
+            os.kill(w["pid"], signal.SIGTERM)  # tears the virtual display down with it
+        raise
+    return Cast(package, window["workspace"]["id"], window["address"], display)
+
+
+casts: dict[str, Cast] = {}
+cast_lock = asyncio.Lock()  # the new display is found by diffing, so one cast starts at a time
+
+
+async def start_cast(writer: asyncio.StreamWriter, package: str) -> None:
+    async with cast_lock:
+        if package in casts:
+            await reply(writer, {"type": "cast", "package": package, "error": f"already on the PC, workspace {casts[package].workspace}"})
+            return
+        try:
+            cast = await asyncio.to_thread(launch_cast, package)
+        except (CastError, OSError, subprocess.SubprocessError) as e:
+            log(f"cast of {package} failed: {e}")
+            await reply(writer, {"type": "cast", "package": package, "error": str(e) if isinstance(e, CastError) else "could not reach adb"})
+            return
+        casts[package] = cast
+        log(f"cast {package}: virtual display {cast.display}, PC workspace {cast.workspace}")
+        await reply(writer, {"type": "cast", "package": package, "workspace": cast.workspace})
+
+
+async def reap_casts() -> None:
+    """Forgets casts whose window is gone: closing it ends scrcpy and with it the virtual display."""
+    if not casts:
+        return
+    open_windows = {c["address"] for c in await asyncio.to_thread(hyprctl, "clients") or []}
+    for package, cast in list(casts.items()):
+        if cast.address not in open_windows:
+            del casts[package]
+            log(f"cast {package} ended")
+
+
 async def handle_video(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     v = view
     if v is None or v.pointer is None:
@@ -845,6 +1041,11 @@ async def on_command(writer: asyncio.StreamWriter, msg: dict) -> None:
     elif cmd == "unview":
         if view is not None and view.owner is writer:
             await end_view()
+    elif cmd == "cast":
+        if valid_package(msg.get("package")):
+            await start_cast(writer, msg["package"])
+        else:
+            await reply(writer, {"type": "cast", "error": "not a package name"})
     elif view is not None and view.owner is writer:
         if cmd == "pointer":
             view.pointer_event(msg)
@@ -894,6 +1095,7 @@ async def watch_hyprland() -> None:
                 await asyncio.sleep(0.05)
                 await broadcast()
                 follow_pc_soon()
+                await reap_casts()
         except (OSError, ConnectionError) as e:
             log(f"Hyprland event socket unavailable ({e}); retrying")
             await asyncio.sleep(3)

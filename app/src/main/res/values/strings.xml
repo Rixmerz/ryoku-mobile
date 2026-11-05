@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="cast_service_description">Shows a small Send to PC button over other apps. Tap it to move the app you are using onto a new desktop of your computer. It only learns which app is in front.</string>
+</resources>

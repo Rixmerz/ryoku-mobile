@@ -25,6 +25,9 @@ data class DesktopWindow(val cls: String, val title: String)
 /** [busy]: a PC monitor is showing it, so the live view mirrors that monitor instead of moving the desktop (see PhoneView in ryoku_link.py). */
 data class Workspace(val id: Int, val name: String, val active: Boolean, val busy: Boolean, val windows: List<DesktopWindow>)
 
+/** The computer's answer to a cast: [workspace] when it opened, [error] when it did not. */
+data class CastReply(val pkg: String, val workspace: Int?, val error: String?)
+
 /** A live view the computer agreed to serve: the stream's size and the port its video is on. */
 data class LiveInfo(val workspace: Int, val width: Int, val height: Int, val port: Int)
 
@@ -48,6 +51,8 @@ class DesktopLink(private val port: Int = 7466) {
     var live by mutableStateOf<LiveInfo?>(null); private set
     /** True when the computer could not open the last view it was asked for. */
     var openFailed by mutableStateOf(false); private set
+    /** The computer's last answer to [cast]: the PC workspace it opened on, or why it could not. */
+    var castReply by mutableStateOf<CastReply?>(null); private set
 
     private val io = Executors.newSingleThreadExecutor()
     private val sender = Executors.newSingleThreadExecutor()
@@ -66,6 +71,9 @@ class DesktopLink(private val port: Int = 7466) {
     fun stop() {
         running = false
         runCatching { socket?.close() }
+        // A link made for one request (see CastService) must not leave its two threads behind.
+        io.shutdown()
+        sender.shutdown()
     }
 
     /** Switches the computer's own monitor; the live view never does that. */
@@ -75,6 +83,12 @@ class DesktopLink(private val port: Int = 7466) {
     fun openView(id: Int, width: Int, height: Int) {
         openFailed = false
         send(JSONObject().put("cmd", "view").put("id", id).put("width", width).put("height", height))
+    }
+
+    /** Sends the app [pkg], running on this phone, to a new workspace of the computer; the answer lands in [castReply]. */
+    fun cast(pkg: String) {
+        castReply = null
+        send(JSONObject().put("cmd", "cast").put("package", pkg))
     }
 
     fun closeView() {
@@ -206,6 +220,7 @@ class DesktopLink(private val port: Int = 7466) {
         when (o.optString("type")) {
             "state" -> parseState(o)
             "view" -> parseView(o)
+            "cast" -> castReply = CastReply(o.optString("package"), if (o.has("workspace")) o.getInt("workspace") else null, o.optString("error").ifEmpty { null })
         }
     }
 

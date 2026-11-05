@@ -1,7 +1,10 @@
 """Run with: python3 -m unittest discover -s pc"""
 
 import asyncio
+import json
 import os
+import shlex
+import signal
 import stat
 import struct
 import tempfile
@@ -374,6 +377,240 @@ class VideoConnection(unittest.TestCase):
         with mock.patch.object(ryoku_link, "view", None):
             asyncio.run(ryoku_link.handle_video(None, writer))
         self.assertTrue(writer.closed)
+
+# Output captured from the Nubia (Android 15) while a YouTube video played.
+STACK_LIST = """RootTask id=1827 bounds=[0,0][900,2030] displayId=0 userId=0
+ configuration={1.0 730mcc2mnc [es_CL] ldltr sw360dp}
+  taskId=1827: com.google.android.youtube/com.google.android.youtube.UrlActivity bounds=[0,0][900,2030] userId=0 visible=true topActivity=ComponentInfo{com.google.android.youtube/com.google.android.apps.youtube.app.watchwhile.InternalMainActivity}
+
+RootTask id=1824 bounds=[0,0][900,2030] displayId=0 userId=0
+  taskId=1824: com.rixmerz.ryokumobile/com.rixmerz.ryokumobile.LauncherActivity bounds=[0,0][900,2030] userId=0 visible=true
+RootTask id=1830 bounds=[0,0][1920,1080] displayId=2 userId=0
+  taskId=1830: com.google.android.apps.youtube.music/.activities.MusicActivity bounds=[0,0][1920,1080] userId=0 visible=true
+"""
+DISPLAYS_BEFORE = """  Display Id=0
+    mBaseDisplayInfo=DisplayInfo{"Pantalla integrada", displayId 0, displayGroupId 0, FLAG_SECURE, real 900 x 2030, type INTERNAL, uniqueId "local:4619827259835644672", app 900 x 2030}
+"""
+DISPLAYS_AFTER = DISPLAYS_BEFORE + """  Display Id=2
+    mBaseDisplayInfo=DisplayInfo{"Superposici\u00f3n #1", displayId 2, displayGroupId 0, FLAG_PRESENTATION, real 1920 x 1080, type OVERLAY, uniqueId "overlay:1", app 1920 x 1080}
+  Display Id=3
+    mBaseDisplayInfo=DisplayInfo{"scrcpy", displayId 3, displayGroupId 0, FLAG_TRUSTED, real 1920 x 1080, type VIRTUAL, uniqueId "virtual:com.android.shell:scrcpy", app 1920 x 1080}
+"""
+
+
+class CastPackage(unittest.TestCase):
+    def test_real_package_names_pass(self):
+        for name in ("com.google.android.youtube", "org.mozilla.firefox", "com.a1.b_2", "com.rixmerz.ryokumobile.debug"):
+            self.assertTrue(ryoku_link.valid_package(name), name)
+
+    def test_shell_strings_and_odd_shapes_are_refused(self):
+        for name in ("com.x; rm -rf ~", "com.x && id", "$(id).a", "com.x\n", "a b.c", "-n.com", "com..x", "com.", ".com.x",
+                     "single", "com.1abc", "com.x`id`", "", None, 7, ["com.x.y"], "a." * 200 + "b", ryoku_link.OWN_PACKAGE):
+            self.assertFalse(ryoku_link.valid_package(name), repr(name))
+
+
+class CastWorkspace(unittest.TestCase):
+    def test_first_unused_id_is_chosen(self):
+        workspaces = [{"id": i, "windows": 1} for i in (1, 2, 3, 4, 5)]
+        self.assertEqual(ryoku_link.free_workspace(workspaces, monitors(pc_workspace=5)), 6)
+
+    def test_a_gap_is_filled_and_an_empty_workspace_counts_as_unused(self):
+        workspaces = [{"id": 1, "windows": 2}, {"id": 2, "windows": 0}, {"id": 3, "windows": 1}]
+        self.assertEqual(ryoku_link.free_workspace(workspaces, monitors(pc_workspace=1)), 2)
+
+    def test_never_the_workspace_a_monitor_shows_even_when_empty(self):
+        self.assertEqual(ryoku_link.free_workspace([{"id": 1, "windows": 1}], monitors(pc_workspace=2)), 3)
+
+    def test_never_the_workspace_the_phone_output_shows(self):
+        self.assertEqual(ryoku_link.free_workspace([], monitors(pc_workspace=1, phone_workspace=2)), 3)
+
+    def test_special_workspaces_are_ignored(self):
+        self.assertEqual(ryoku_link.free_workspace([{"id": -98, "windows": 1}], monitors(pc_workspace=4)), 1)
+
+
+class CastPhoneState(unittest.TestCase):
+    def test_the_front_task_of_the_package_on_the_phone_display_is_found(self):
+        self.assertEqual(ryoku_link.find_root_task(STACK_LIST, "com.google.android.youtube"), 1827)
+
+    def test_a_task_on_another_display_or_another_package_is_not(self):
+        self.assertIsNone(ryoku_link.find_root_task(STACK_LIST, "com.google.android.apps.youtube.music"))  # on display 2
+        self.assertEqual(ryoku_link.find_root_task(STACK_LIST, "com.google.android.apps.youtube.music", display=2), 1830)
+        self.assertIsNone(ryoku_link.find_root_task(STACK_LIST, "com.google.android.youtub"))
+
+    def test_the_new_virtual_display_is_the_one_that_appeared(self):
+        before = ryoku_link.parse_displays(DISPLAYS_BEFORE)
+        self.assertEqual(before, {0: "INTERNAL"})
+        after = ryoku_link.parse_displays(DISPLAYS_AFTER)
+        self.assertEqual(after, {0: "INTERNAL", 2: "OVERLAY", 3: "VIRTUAL"})
+        self.assertEqual(ryoku_link.new_display(before, after), 3)  # not the simulated overlay display
+        self.assertIsNone(ryoku_link.new_display(after, after))
+
+
+class CastArgv(unittest.TestCase):
+    def test_scrcpy_gets_a_new_display_but_never_starts_the_app(self):
+        argv = ryoku_link.scrcpy_argv("/usr/bin/scrcpy", "324751914997", "ryoku-cast com.x.y", keep_apps=True)
+        self.assertEqual(argv[:4], ["/usr/bin/scrcpy", "-s", "324751914997", "--new-display=1920x1080/240"])
+        self.assertIn("--window-title=ryoku-cast com.x.y", argv)
+        self.assertIn("--audio-source=playback", argv)
+        self.assertIn("--no-vd-destroy-content", argv)
+        self.assertFalse([a for a in argv if a.startswith("--start-app")])  # that would start a second task
+
+    def test_the_keep_flag_is_left_out_when_this_scrcpy_has_none(self):
+        self.assertNotIn("--no-vd-destroy-content", ryoku_link.scrcpy_argv("scrcpy", "S", "t", keep_apps=False))
+
+    def test_the_hyprland_command_places_the_window_silently_and_quotes_every_word(self):
+        argv = ryoku_link.scrcpy_argv("/opt/my scrcpy/scrcpy", "S1", "ryoku-cast com.x.y", keep_apps=True)
+        lua = ryoku_link.exec_in_workspace(argv, 7, "/run/user/1/ryoku-link/cast-com.x.y.log")
+        self.assertTrue(lua.startswith("hl.dsp.exec_cmd(") and lua.endswith('{ workspace = "7 silent" })'))
+        command = json.loads(lua[len("hl.dsp.exec_cmd("):lua.index(", { workspace")])
+        words = shlex.split(command)
+        self.assertEqual(words[words.index("/opt/my scrcpy/scrcpy"):][:2], ["/opt/my scrcpy/scrcpy", "-s"])
+        self.assertIn("--window-title=ryoku-cast com.x.y", words)
+        self.assertTrue(command.endswith(">/run/user/1/ryoku-link/cast-com.x.y.log 2>&1"))
+
+
+class FakeCastWriter:
+    def __init__(self):
+        self.sent = []
+
+    def write(self, data):
+        self.sent.append(json.loads(data))
+
+    async def drain(self):
+        pass
+
+
+class CastCommand(unittest.TestCase):
+    """The `cast` message through on_command, the entry the phone uses; scrcpy, adb and Hyprland are stubbed."""
+
+    def setUp(self):
+        self.addCleanup(ryoku_link.casts.clear)
+        patcher = mock.patch.object(ryoku_link, "log")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_cast(self, message, launch=None):
+        writer = FakeCastWriter()
+        with mock.patch.object(ryoku_link, "launch_cast", launch or mock.Mock()) as launched:
+            asyncio.run(ryoku_link.on_command(writer, message))
+        return writer.sent, launched
+
+    def test_a_valid_package_is_launched_and_the_phone_is_told_the_workspace(self):
+        sent, launched = self.run_cast({"cmd": "cast", "package": "com.google.android.youtube"},
+                                       mock.Mock(return_value=ryoku_link.Cast("com.google.android.youtube", 7, "0xabc", 3)))
+        launched.assert_called_once_with("com.google.android.youtube")
+        self.assertEqual(sent, [{"type": "cast", "package": "com.google.android.youtube", "workspace": 7}])
+        self.assertEqual(ryoku_link.casts["com.google.android.youtube"].display, 3)
+
+    def test_a_shell_string_never_reaches_the_launcher(self):
+        for bad in ("com.x; reboot", "$(id)", 5, None):
+            sent, launched = self.run_cast({"cmd": "cast", "package": bad})
+            launched.assert_not_called()
+            self.assertEqual(sent, [{"type": "cast", "error": "not a package name"}])
+
+    def test_a_failed_cast_reports_the_reason_and_is_not_remembered(self):
+        sent, _ = self.run_cast({"cmd": "cast", "package": "com.x.y"}, mock.Mock(side_effect=ryoku_link.CastError("scrcpy is not installed on the computer")))
+        self.assertEqual(sent, [{"type": "cast", "package": "com.x.y", "error": "scrcpy is not installed on the computer"}])
+        self.assertEqual(ryoku_link.casts, {})
+
+    def test_a_second_cast_of_the_same_app_is_refused(self):
+        ryoku_link.casts["com.x.y"] = ryoku_link.Cast("com.x.y", 8, "0x1", 3)
+        sent, launched = self.run_cast({"cmd": "cast", "package": "com.x.y"})
+        launched.assert_not_called()
+        self.assertEqual(sent, [{"type": "cast", "package": "com.x.y", "error": "already on the PC, workspace 8"}])
+
+    def test_closing_the_window_forgets_the_cast(self):
+        ryoku_link.casts["com.x.y"] = ryoku_link.Cast("com.x.y", 8, "0x1", 3)
+        ryoku_link.casts["com.a.b"] = ryoku_link.Cast("com.a.b", 9, "0x2", 4)
+        with mock.patch.object(ryoku_link, "hyprctl", return_value=[{"address": "0x2"}]):
+            asyncio.run(ryoku_link.reap_casts())
+        self.assertEqual(list(ryoku_link.casts), ["com.a.b"])
+
+
+class FakeScrcpy(unittest.TestCase):
+    """launch_cast end to end against a scrcpy stub: the order of the steps and what each one is given."""
+
+    def make_stub(self, directory, text="  --new-display  --no-vd-destroy-content\n"):
+        path = os.path.join(directory, "scrcpy")
+        with open(path, "w") as f:
+            f.write(f"#!/bin/sh\ncat <<'EOF'\n{text}EOF\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def scenario(self, directory, *, stub_text=None, stack=STACK_LIST, moved_stack=None):
+        calls, dispatched = [], []
+        displays = iter([DISPLAYS_BEFORE, DISPLAYS_AFTER, DISPLAYS_AFTER])
+        stacks = iter([stack, moved_stack or stack.replace("displayId=0", "displayId=3", 1)])
+
+        def adb(serial, *args, timeout=8):
+            calls.append(args)
+            if args[:2] == ("shell", "pm"):
+                return "package:/data/app/base.apk\n"
+            if args[:3] == ("shell", "am", "stack"):
+                return next(stacks)
+            if args[:3] == ("shell", "dumpsys", "display"):
+                return next(displays, DISPLAYS_AFTER)
+            return ""
+
+        def hypr(*args):
+            return {"workspaces": [{"id": i, "windows": 1} for i in (1, 2, 3, 4, 5)], "monitors": monitors(5),
+                    "clients": [{"title": "ryoku-cast com.google.android.youtube", "pid": 99, "address": "0xfeed", "workspace": {"id": 6}}]}[args[0]]
+
+        stub = self.make_stub(directory, stub_text) if stub_text is not None else self.make_stub(directory)
+        with mock.patch.object(ryoku_link, "SCRCPY", stub), mock.patch.object(ryoku_link, "adb", adb), \
+                mock.patch.object(ryoku_link, "hyprctl", hypr), mock.patch.object(ryoku_link, "SOCKET_DIR", directory), \
+                mock.patch.object(ryoku_link, "reverse_targets", return_value=["192.168.1.9:5555", "324751914997"]), \
+                mock.patch.object(ryoku_link, "dispatch", lambda *lua: dispatched.append(lua) or True), \
+                mock.patch.object(ryoku_link, "log"):
+            try:
+                cast = ryoku_link.launch_cast("com.google.android.youtube")
+            except ryoku_link.CastError as e:
+                return e, calls, dispatched
+        return cast, calls, dispatched
+
+    def test_the_app_is_moved_to_the_new_display_and_the_window_goes_to_the_first_free_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cast, calls, dispatched = self.scenario(tmp)
+        self.assertEqual((cast.display, cast.address), (3, "0xfeed"))
+        self.assertIn(("shell", "am", "display", "move-stack", "1827", "3"), calls)
+        self.assertEqual(len(dispatched), 1)
+        self.assertIn('workspace = "6 silent" }', dispatched[0][0])  # 1-5 hold windows, 5 is on the monitor
+        self.assertIn("--new-display=1920x1080/240", dispatched[0][0])
+        self.assertIn("-s 324751914997", dispatched[0][0])  # the USB phone, not the TCP one
+
+    def test_the_phone_is_asked_about_nothing_but_a_validated_name_and_integers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, calls, _ = self.scenario(tmp)
+        self.assertIn(("shell", "pm", "path", "com.google.android.youtube"), calls)
+        move = next(c for c in calls if "move-stack" in c)
+        self.assertTrue(all(a.isdigit() for a in move[-2:]))
+
+    def test_an_old_scrcpy_without_virtual_displays_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err, _, dispatched = self.scenario(tmp, stub_text="  --serial\n")
+        self.assertIsInstance(err, ryoku_link.CastError)
+        self.assertIn("too old", str(err))
+        self.assertEqual(dispatched, [])
+
+    def test_an_app_that_is_not_running_is_reported_before_scrcpy_starts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err, _, dispatched = self.scenario(tmp, stack="RootTask id=1 bounds=[0,0][1,1] displayId=0 userId=0\n  taskId=1: com.other.app/.Main\n")
+        self.assertIn("not running", str(err))
+        self.assertEqual(dispatched, [])
+
+    def test_missing_scrcpy_is_reported_without_touching_adb_or_the_desktop(self):
+        with mock.patch.object(ryoku_link, "SCRCPY", None), mock.patch.object(ryoku_link, "adb") as adb, \
+                mock.patch.object(ryoku_link, "dispatch") as dispatch:
+            with self.assertRaisesRegex(ryoku_link.CastError, "scrcpy is not installed"):
+                ryoku_link.launch_cast("com.google.android.youtube")
+        adb.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_an_app_android_will_not_move_ends_the_scrcpy_window(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(os, "kill") as kill:
+            err, _, _ = self.scenario(tmp, moved_stack=STACK_LIST)  # still on display 0 after the move
+        self.assertIn("would not move", str(err))
+        kill.assert_called_once_with(99, signal.SIGTERM)
 
 
 if __name__ == "__main__":
