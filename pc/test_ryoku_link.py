@@ -147,5 +147,67 @@ class PrivateSocket(unittest.TestCase):
                 asyncio.run(scenario(directory))
 
 
+class VideoConnection(unittest.TestCase):
+    """The phone only draws what arrives on the video socket: a connection that starts no encoder is a black screen."""
+
+    def test_video_connection_records_the_headless_output_and_relays_the_bytes(self):
+        class FakeEncoder:
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b"\x00\x00\x00\x01frame")
+                self.stdout.feed_eof()
+
+            async def wait(self):
+                return 0
+
+        class FakeWriter:
+            def __init__(self):
+                self.sent, self.closed = b"", False
+
+            def write(self, data):
+                self.sent += data
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        async def scenario():
+            v = ryoku_link.PhoneView(None, 1080, 2400)
+            v.pointer = object()  # an open view; no compositor is touched
+            writer, spawned = FakeWriter(), []
+
+            async def spawn(*argv, **kwargs):
+                spawned.append(argv)
+                return FakeEncoder()
+
+            with mock.patch.object(ryoku_link, "view", v), \
+                    mock.patch.object(asyncio, "create_subprocess_exec", spawn):
+                await ryoku_link.handle_video(None, writer)
+            return writer, spawned
+
+        with mock.patch.object(ryoku_link, "log"):
+            writer, spawned = asyncio.run(scenario())
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(spawned[0][:3], ("wf-recorder", "-o", ryoku_link.OUTPUT))
+        self.assertEqual(writer.sent, b"\x00\x00\x00\x01frame")
+        self.assertTrue(writer.closed)
+
+    def test_video_connection_without_an_open_view_is_closed_untouched(self):
+        class Writer:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        writer = Writer()
+        with mock.patch.object(ryoku_link, "view", None):
+            asyncio.run(ryoku_link.handle_video(None, writer))
+        self.assertTrue(writer.closed)
+
+
 if __name__ == "__main__":
     unittest.main()
