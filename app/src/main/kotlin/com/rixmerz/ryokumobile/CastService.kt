@@ -97,6 +97,8 @@ class CastService : AccessibilityService() {
             KeyEvent.KEYCODE_VOLUME_DOWN -> -1
             else -> return false
         }
+        // Only while YouTube is in front: in any other app the volume buttons are the phone's again.
+        if (front == null) return false
         return PcSession.volumeKey(step, down = event.action == KeyEvent.ACTION_DOWN)
     }
 
