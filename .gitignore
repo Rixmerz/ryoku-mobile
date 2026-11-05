@@ -5,3 +5,5 @@ local.properties
 *.apk
 __pycache__/
 test-artifacts/
+.fresh-dev/
+.mcp-docs/
