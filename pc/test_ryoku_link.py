@@ -938,7 +938,14 @@ class WatchCasts(unittest.TestCase):
             self.ended.append(reason)
             ryoku_link.casts.pop(cast.package, None)
 
-        for name, fake in (("log", lambda m: None), ("end_cast", end_cast)):
+        self.frozen = False
+        self.recast = []
+
+        async def recast(cast):
+            self.recast.append(cast.recoveries)
+
+        for name, fake in (("log", lambda m: None), ("end_cast", end_cast), ("recast", recast),
+                           ("picture_frozen", lambda cast: self.frozen)):
             patcher = mock.patch.object(ryoku_link, name, fake)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -981,10 +988,90 @@ class WatchCasts(unittest.TestCase):
         self.assertEqual(self.ended, [])
         self.assertIn(YT, ryoku_link.casts)
 
+    def test_a_frozen_picture_restarts_the_cast_until_the_limit(self):
+        self.frozen = True
+        self.watch([None, None, None], polls=3)
+        self.assertEqual(self.recast, [0, 0, 0])  # the stub never raises recoveries: the real recast does
+        self.assertEqual(self.ended, [])
+
+    def test_a_cast_restarted_too_often_is_left_alone(self):
+        self.frozen = True
+        ryoku_link.casts[YT] = cast = a_cast()
+        cast.recoveries = ryoku_link.MAX_RECOVERIES
+        answers = [None]
+
+        async def go():
+            real_sleep = asyncio.sleep
+            rounds = []
+
+            async def sleep(_):
+                rounds.append(1)
+                if len(rounds) > 1:
+                    raise asyncio.CancelledError
+                await real_sleep(0)
+
+            with mock.patch.object(ryoku_link, "cast_problem", lambda c: answers[0]), mock.patch.object(ryoku_link.asyncio, "sleep", sleep):
+                try:
+                    await ryoku_link.watch_casts()
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(go())
+        self.assertEqual(self.recast, [])
+        self.assertIn(YT, ryoku_link.casts)
+
     def test_an_unreachable_phone_is_not_a_dead_cast(self):
         self.watch([OSError("adb offline")] * 3, polls=3)
         self.assertEqual(self.ended, [])
         self.assertIn(YT, ryoku_link.casts)
+
+
+class FrozenPicture(unittest.TestCase):
+    """picture_frozen: the same picture for FROZEN_AFTER seconds while the video plays."""
+
+    def setUp(self):
+        self.now = 100.0
+        self.digests = []
+        self.state = "PLAYING"
+        for target, fake in (("window_picture", lambda cast: self.digests.pop(0)), ("playback_state", lambda s, p: self.state)):
+            patcher = mock.patch.object(ryoku_link, target, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(ryoku_link.time, "monotonic", lambda: self.now)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cast = a_cast()
+
+    def check(self, digest, after):
+        self.now += after
+        self.digests.append(digest)
+        return ryoku_link.picture_frozen(self.cast)
+
+    def test_a_picture_that_keeps_moving_is_never_frozen(self):
+        for i in range(6):
+            self.assertFalse(self.check(f"frame{i}", 10))
+
+    def test_the_same_picture_for_long_enough_while_playing_is_frozen(self):
+        self.assertFalse(self.check("a", 2))
+        self.assertFalse(self.check("a", ryoku_link.FROZEN_AFTER - 1))
+        self.assertTrue(self.check("a", 2))
+
+    def test_a_paused_video_may_stand_still(self):
+        self.state = "PAUSED"
+        self.check("a", 2)
+        self.assertFalse(self.check("a", ryoku_link.FROZEN_AFTER + 5))
+
+    def test_a_window_nobody_can_see_is_not_counted_and_restarts_the_clock(self):
+        self.check("a", 2)
+        self.assertFalse(self.check(None, ryoku_link.FROZEN_AFTER))  # on another workspace: no frames are drawn
+        self.assertFalse(self.check("a", 1))  # back in view: counting starts here, not from before it was hidden
+        self.assertFalse(self.check("a", ryoku_link.FROZEN_AFTER - 1))
+        self.assertTrue(self.check("a", 2))
+
+    def test_a_moving_picture_clears_the_restart_count(self):
+        self.cast.recoveries = 2
+        self.check("a", 1)
+        self.assertEqual(self.cast.recoveries, 0)
 
 
 if __name__ == "__main__":

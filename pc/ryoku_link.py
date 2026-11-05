@@ -45,6 +45,7 @@ Requires Hyprland configured through its Lua API (`hl.dsp`, `hl.monitor`), wf-re
 """
 
 import asyncio
+import hashlib
 import itertools
 import json
 import math
@@ -855,6 +856,9 @@ OWN_PACKAGE = "com.rixmerz.ryokumobile"
 # The only apps that may be cast for now; add a package here to allow another one.
 CASTABLE_PACKAGES = frozenset({"com.google.android.youtube"})
 KEEP_APPS_FLAG = "--no-vd-destroy-content"
+GRIM = shutil.which("grim")  # screenshots of the cast window, to notice a frozen picture; None: not checked
+FROZEN_AFTER = 15.0  # seconds of an unchanged picture, while the video plays, before the cast is restarted
+MAX_RECOVERIES = 2  # restarts for one stuck picture before the bridge leaves the cast alone
 
 
 class CastError(Exception):
@@ -869,7 +873,8 @@ class Cast:
         self.serial = serial  # the phone's adb serial, for the health checks
         self.misses = 0  # consecutive failed health checks (see watch_casts)
         self.recoveries = 0  # times a frozen picture made the bridge cast this app again
-        self.log_path: str | None = None  # scrcpy's output; --print-fps keeps it moving while frames arrive
+        self.picture: str | None = None  # digest of what the window showed at the last frozen-picture check
+        self.picture_since = 0.0  # time.monotonic() from which the window has shown exactly that picture
 
 
 def valid_package(value) -> bool:
@@ -1027,6 +1032,31 @@ def cast_problem(cast: Cast) -> str | None:
     return None
 
 
+def window_picture(cast: Cast) -> str | None:
+    """A digest of what the cast window shows on the PC right now, None when it cannot be seen: not on
+    the workspace a monitor displays (Hyprland draws nothing for it then) or no grim. Blocking."""
+    window = window_at(cast.address)
+    if window is None or not GRIM or window["workspace"]["id"] not in {m["activeWorkspace"]["id"] for m in hyprctl("monitors") or []}:
+        return None
+    (x, y), (w, h) = window["at"], window["size"]
+    shot = subprocess.run([GRIM, "-g", f"{x},{y} {w}x{h}", "-t", "ppm", "-"], capture_output=True, timeout=5)
+    return hashlib.md5(shot.stdout).hexdigest() if shot.returncode == 0 and shot.stdout else None
+
+
+def picture_frozen(cast: Cast) -> bool:
+    """True when the window has shown the very same picture for FROZEN_AFTER seconds while the app's
+    media session says it is playing: the audio goes on, the picture does not. Blocking.
+    ponytail: a video that really stands still for that long (a music track over one image) looks the same;
+    the watcher recasts at most MAX_RECOVERIES times for it, then leaves the cast alone."""
+    digest, now = window_picture(cast), time.monotonic()
+    if digest is None or digest != cast.picture:
+        cast.picture, cast.picture_since = digest, now  # hidden, or the picture moved: start counting again
+        if digest is not None:
+            cast.recoveries = 0
+        return False
+    return now - cast.picture_since >= FROZEN_AFTER and playback_state(cast.serial, cast.package) == "PLAYING"
+
+
 def close_cast_window(address: str) -> None:
     """Ends scrcpy, and with it the virtual display, by signalling the process of the window at `address`.
     Waits for the window to go; a scrcpy that ignores SIGTERM is killed."""
@@ -1112,7 +1142,6 @@ def launch_cast(package: str) -> Cast:
             os.kill(w["pid"], signal.SIGTERM)  # tears the virtual display down with it
         raise
     cast = Cast(package, window["workspace"]["id"], window["address"], display, previous, serial)
-    cast.log_path = log_path
     if not dispatch(*show_cast(cast)):
         log(f"cast {package}: could not switch the PC to workspace {cast.workspace}")
     return cast
@@ -1135,14 +1164,36 @@ async def return_pc(ended: list[Cast]) -> None:
     await asyncio.to_thread(set_zoom, 1.0)
 
 
-async def end_cast(cast: Cast, reason: str) -> None:
+async def end_cast(cast: Cast, reason: str, return_to_previous: bool = True) -> None:
     """Ends a cast: closes its window (which tears the virtual display down), forgets it and returns the PC.
     The caller holds cast_lock."""
     if casts.get(cast.package) is cast:
         del casts[cast.package]
     log(f"cast {cast.package} ended: {reason}")
     await asyncio.to_thread(close_cast_window, cast.address)
-    await return_pc([cast])
+    if return_to_previous:
+        await return_pc([cast])
+
+
+async def recast(cast: Cast) -> None:
+    """Restarts a cast whose picture froze: a new scrcpy (a new video stream and virtual display) with
+    the same app, shown where the old one was. The PC is not sent back in between, and it goes back to
+    where it was before the first cast. The caller holds cast_lock."""
+    await end_cast(cast, "the picture froze while the video played; casting it again", return_to_previous=False)
+    for attempt in range(3):  # the app takes a moment to come back to the phone's own display
+        try:
+            fresh = await asyncio.to_thread(launch_cast, cast.package)
+            break
+        except (CastError, OSError, subprocess.SubprocessError) as e:
+            log(f"cast {cast.package}: restart attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(2)
+    else:
+        await return_pc([cast])
+        return
+    fresh.previous, fresh.recoveries = cast.previous, cast.recoveries + 1
+    casts[cast.package] = fresh
+    log(f"cast {cast.package}: restarted on virtual display {fresh.display}, PC workspace {fresh.workspace}")
+    await asyncio.to_thread(autoplay, fresh)
 
 
 async def start_cast(writer: asyncio.StreamWriter, package: str) -> None:
@@ -1217,13 +1268,24 @@ async def watch_casts() -> None:
                 if casts.get(cast.package) is not cast:
                     continue
                 try:
-                    problem = await asyncio.to_thread(cast_problem, cast)
-                except (OSError, ValueError, subprocess.SubprocessError) as e:
+                    problem, frozen = await asyncio.to_thread(check_cast, cast)
+                except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
                     log(f"cast {cast.package}: health check failed ({e})")
                     continue  # could not tell: the cast stays until adb answers
                 cast.misses = cast.misses + 1 if problem else 0
                 if problem and cast.misses >= CAST_MISSES:
                     await end_cast(cast, problem)
+                elif frozen and cast.recoveries < MAX_RECOVERIES:
+                    await recast(cast)
+                elif frozen:
+                    cast.picture_since = time.monotonic()  # said once per window of FROZEN_AFTER
+                    log(f"cast {cast.package}: the picture looks frozen but was restarted {cast.recoveries} times already; leaving it")
+
+
+def check_cast(cast: Cast) -> tuple[str | None, bool]:
+    """(why the cast is dead or None, whether its picture is frozen). Blocking."""
+    problem = cast_problem(cast)
+    return problem, problem is None and picture_frozen(cast)
 
 
 async def handle_video(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
