@@ -7,7 +7,7 @@ network. The control protocol is newline-delimited JSON, the same for any future
 
   server -> phone  {"type": "state", "host": "...", "workspaces": [{"id", "name", "active",
                     "busy", "windows": [{"class", "title"}]}], "viewing": <id or null>}
-  server -> phone  {"type": "view", "workspace": 3, "width": 864, "height": 1920, "port": 7467}
+  server -> phone  {"type": "view", "workspace": 3, "width": 1920, "height": 864, "port": 7467}
                    or {"type": "view", "workspace": 3, "busy": true} when the PC monitor shows it
   phone -> server  {"cmd": "workspace", "id": 3}            switch the PC monitor's workspace
   phone -> server  {"cmd": "view", "id": 3, "width": 1080, "height": 2400}
@@ -36,11 +36,10 @@ import re
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
-
-from wl_pointer import BTN, VirtualPointer
 
 PORT = int(os.environ.get("RYOKU_LINK_PORT", "7466"))
 VIDEO_PORT = int(os.environ.get("RYOKU_LINK_VIDEO_PORT", str(PORT + 1)))
@@ -56,10 +55,8 @@ ADB = os.environ.get("RYOKU_ADB") or (
 OUTPUT = "RYOKU-PHONE"
 FPS = 30
 # Encoding big frames on the CPU at 30 fps is the latency bottleneck, so the stream's long side
-# is capped here. It is also the mode the desktop's `ryoku-monitor autoscale` forces on a new
-# output ("highrr" of a headless output is 1920x1080), see PhoneView.open.
+# is capped here and the phone letterboxes nothing: the output keeps the phone's aspect.
 MAX_SIDE = 1920
-NATIVE = (1920, 1080)
 # After this many seconds without phone input the PC's cursor and focus are handed back.
 REST_AFTER = 2.0
 # x264 for a live view: no B-frames or lookahead (latency), one thread and one slice per frame
@@ -172,6 +169,177 @@ async def reply(writer: asyncio.StreamWriter, msg: dict) -> None:
     await writer.drain()
 
 
+# ---- Virtual pointer pinned to one Wayland output, speaking the wire protocol directly ----
+#
+# No `wlrctl`, `ydotool` or uinput access is needed: Hyprland implements
+# zwlr_virtual_pointer_manager_v1, and `create_virtual_pointer_with_output` makes absolute
+# motion land on that output only. That is what lets the phone drive the headless output
+# without the physical monitor's coordinates ever coming into play. Only the handful of
+# requests this needs are encoded; there is no event loop and no file descriptor passing.
+# (Kept in this file on purpose: the bridge is started as a single script, `python3 -I`.)
+
+BTN = {"left": 0x110, "right": 0x111, "middle": 0x112}
+# Absolute motion is sent on a fixed grid; the compositor scales it to the bound output.
+EXTENT = 0xFFFF
+AXIS_VERTICAL, AXIS_HORIZONTAL = 0, 1
+AXIS_SOURCE_FINGER = 1
+# One wheel notch in the protocol's axis units.
+AXIS_PER_LINE = 15.0
+
+# Object ids the client allocates, in creation order.
+DISPLAY, REGISTRY = 1, 2
+
+
+def _string(s: str) -> bytes:
+    raw = s.encode() + b"\0"
+    return struct.pack("<I", len(raw)) + raw + b"\0" * (-len(raw) % 4)
+
+
+def pack(obj: int, opcode: int, body: bytes = b"") -> bytes:
+    return struct.pack("<II", obj, ((8 + len(body)) << 16) | opcode) + body
+
+
+def _fixed(v: float) -> int:
+    return round(v * 256)
+
+
+def unpack(buf: bytes) -> tuple[list[tuple[int, int, bytes]], bytes]:
+    """Splits a byte stream into (object, opcode, body) messages plus the unfinished tail."""
+    msgs = []
+    while len(buf) >= 8:
+        obj, word = struct.unpack_from("<II", buf)
+        size = word >> 16
+        if size < 8:
+            raise ValueError(f"malformed Wayland message size {size}")
+        if len(buf) < size:
+            break
+        msgs.append((obj, word & 0xFFFF, buf[8:size]))
+        buf = buf[size:]
+    return msgs, buf
+
+
+def _read_string(body: bytes, at: int) -> tuple[str, int]:
+    (n,) = struct.unpack_from("<I", body, at)
+    text = body[at + 4:at + 4 + n - 1].decode(errors="replace")
+    return text, at + 4 + n + (-n % 4)
+
+
+class VirtualPointer:
+    def __init__(self, output_name: str, timeout: float = 3.0):
+        runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        path = os.path.join(runtime, os.environ.get("WAYLAND_DISPLAY", "wayland-0"))
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(timeout)
+        self.sock.connect(path)
+        self._buf = b""
+        self._next_id = REGISTRY + 1
+        try:
+            self._id = self._setup(output_name)
+        except BaseException:
+            self.sock.close()
+            raise
+
+    def _alloc(self) -> int:
+        self._next_id += 1
+        return self._next_id - 1
+
+    def _roundtrip(self) -> list[tuple[int, int, bytes]]:
+        """Sends wl_display.sync and returns every event up to its callback."""
+        cb = self._alloc()
+        self.sock.sendall(pack(DISPLAY, 0, struct.pack("<I", cb)))
+        got = []
+        while True:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("Wayland compositor closed the connection")
+            self._buf += chunk
+            msgs, self._buf = unpack(self._buf)
+            for m in msgs:
+                if m[0] == DISPLAY and m[1] == 0:
+                    obj, code = struct.unpack_from("<II", m[2])
+                    raise RuntimeError(f"Wayland protocol error on object {obj}, code {code}: {_read_string(m[2], 8)[0]}")
+                got.append(m)
+            if any(m[0] == cb for m in got):
+                return got
+
+    def _bind(self, name: int, interface: str, version: int) -> int:
+        new = self._alloc()
+        self.sock.sendall(pack(REGISTRY, 0, struct.pack("<I", name) + _string(interface) + struct.pack("<II", version, new)))
+        return new
+
+    def _setup(self, output_name: str) -> int:
+        self.sock.sendall(pack(DISPLAY, 1, struct.pack("<I", REGISTRY)))
+        globals_: dict[str, list[tuple[int, int]]] = {}
+        for obj, op, body in self._roundtrip():
+            if obj == REGISTRY and op == 0:
+                name = struct.unpack_from("<I", body)[0]
+                iface, at = _read_string(body, 4)
+                globals_.setdefault(iface, []).append((name, struct.unpack_from("<I", body, at)[0]))
+        manager = globals_.get("zwlr_virtual_pointer_manager_v1")
+        if not manager or not globals_.get("wl_output"):
+            raise RuntimeError("compositor lacks zwlr_virtual_pointer_manager_v1 or has no outputs")
+
+        # wl_output v4 announces its connector name; bind them all and match ours.
+        outputs = {self._bind(n, "wl_output", min(v, 4)): None for n, v in globals_["wl_output"]}
+        for obj, op, body in self._roundtrip():
+            if obj in outputs and op == 4:
+                outputs[obj] = _read_string(body, 0)[0]
+        target = next((o for o, n in outputs.items() if n == output_name), None)
+        if target is None:
+            raise RuntimeError(f"no Wayland output named {output_name!r}")
+
+        mgr_name, mgr_ver = manager[0]
+        mgr = self._bind(mgr_name, "zwlr_virtual_pointer_manager_v1", min(mgr_ver, 2))
+        ptr = self._alloc()
+        # create_virtual_pointer_with_output(seat=null, output, id): needs manager v2.
+        self.sock.sendall(pack(mgr, 2, struct.pack("<III", 0, target, ptr)))
+        self._roundtrip()
+        return ptr
+
+    def _send(self, opcode: int, *fields: int, signed: bool = False) -> None:
+        fmt = "<" + ("i" if signed else "I") * len(fields)
+        self.sock.sendall(pack(self._id, opcode, struct.pack(fmt, *fields)))
+
+    @staticmethod
+    def _now() -> int:
+        return int(time.monotonic() * 1000) & 0xFFFFFFFF
+
+    def _frame(self) -> None:
+        self._send(4)
+
+    def move_to(self, x: float, y: float) -> None:
+        """x, y in 0..1 across the bound output."""
+        cx = round(min(max(x, 0.0), 1.0) * EXTENT)
+        cy = round(min(max(y, 0.0), 1.0) * EXTENT)
+        self._send(1, self._now(), cx, cy, EXTENT, EXTENT)
+        self._frame()
+
+    def button(self, name: str, pressed: bool) -> None:
+        self._send(2, self._now(), BTN[name], 1 if pressed else 0)
+        self._frame()
+
+    def scroll(self, dx: float, dy: float) -> None:
+        """Smooth finger scrolling, in wheel lines (positive dy scrolls content down)."""
+        self._send(5, AXIS_SOURCE_FINGER)
+        for axis, lines in ((AXIS_HORIZONTAL, dx), (AXIS_VERTICAL, dy)):
+            if lines:
+                self.sock.sendall(pack(self._id, 3, struct.pack("<IIi", self._now(), axis, _fixed(lines * AXIS_PER_LINE))))
+        self._frame()
+
+    def scroll_end(self) -> None:
+        """Tells clients the finger lifted, so they can start kinetic scrolling."""
+        for axis in (AXIS_HORIZONTAL, AXIS_VERTICAL):
+            self._send(6, self._now(), axis)
+        self._frame()
+
+    def close(self) -> None:
+        try:
+            self._send(8)
+        except OSError:
+            pass  # compositor already gone; the socket close below releases the pointer anyway
+        self.sock.close()
+
+
 class PhoneView:
     """The headless output standing in for the phone's screen, and everything to undo with it.
 
@@ -190,13 +358,7 @@ class PhoneView:
 
     def __init__(self, owner: asyncio.StreamWriter, width: int, height: int):
         self.owner = owner
-        # `ryoku-monitor autoscale` (this desktop's hotplug hook) re-asserts each output's
-        # configured mode every 2 s for about 12 s after it appears, and for an output it has
-        # never seen that mode is the headless default, 1920x1080. Fighting it costs a ~13 s
-        # wait for the phone's own size, so where it exists the native mode is used and the
-        # phone letterboxes it; elsewhere the output takes the phone's aspect.
-        self.fought = shutil.which("ryoku-monitor") is not None
-        self.width, self.height = NATIVE if self.fought else output_size(width, height)
+        self.width, self.height = output_size(width, height)
         self.pointer: VirtualPointer | None = None
         self.stream: asyncio.Task | None = None
         self.watcher: asyncio.Task | None = None
@@ -213,10 +375,14 @@ class PhoneView:
         subprocess.run(["hyprctl", "output", "create", "headless", OUTPUT], capture_output=True, timeout=3)
         try:
             spec = f'hl.monitor({{ output = "{OUTPUT}", mode = "{self.width}x{self.height}@{FPS}", position = "auto-right", scale = 1 }})'
-            # Hyprland ignores a monitor rule sent before it has registered the new output, so the
-            # rule is re-sent until the output reports the size. The encoder only starts once it
-            # has held for a while: a size change under a running encoder garbles the stream.
-            hold = 5 if self.fought else 15
+            # The desktop's `ryoku-monitor autoscale` runs on every hotplug and, for about 12 s,
+            # re-asserts a 1920x1080 mode every 2 s over any size set meanwhile. Setting ours
+            # in that window just loses, so it is waited out first (about 13 s on such a desktop).
+            if shutil.which("ryoku-monitor"):
+                self._wait_out_autoscale()
+            # Hyprland also ignores a monitor rule sent before it has registered the new output,
+            # so the rule is re-sent until the output reports the size. The encoder only starts
+            # once the size has held: a size change under a running encoder garbles the stream.
             held = 0
             for _ in range(60):
                 m = self.phone_monitor()
@@ -225,7 +391,7 @@ class PhoneView:
                 else:
                     held = 0
                     subprocess.run(["hyprctl", "eval", spec], capture_output=True, timeout=3)
-                if held == hold:
+                if held == 5:
                     break
                 time.sleep(0.2)
             else:
@@ -235,6 +401,21 @@ class PhoneView:
         except BaseException:
             self.close()
             raise
+
+    @staticmethod
+    def _wait_out_autoscale() -> None:
+        start = time.monotonic()
+        seen, idle = False, 0
+        while time.monotonic() - start < 25:
+            if subprocess.run(["pgrep", "-f", "ryoku-monitor autoscale"], capture_output=True).returncode == 0:
+                seen, idle = True, 0
+            else:
+                idle += 1
+                # Not running for 1 s: it finished, or it never started (3 s grace to start).
+                if idle >= 4 and (seen or time.monotonic() - start > 3):
+                    return
+            time.sleep(0.25)
+        log("ryoku-monitor autoscale still running after 25 s; sizing the output anyway")
 
     def close(self) -> None:
         if self.pointer:
@@ -306,8 +487,7 @@ class PhoneView:
         return self._send_home(*home)
 
     def reclaim_strays(self) -> None:
-        """Hyprland parks some hidden workspaces on a freshly created output (on this desktop,
-        3 and 5). Left there they would swallow the PC's own
+        """Hyprland parks some hidden workspaces on a freshly created output. Left there they would swallow the PC's own
         workspace shortcuts, so each goes back to a PC monitor, one dispatch batch for all."""
         phone = self.phone_monitor()
         mons = hyprctl("monitors") or []

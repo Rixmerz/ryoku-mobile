@@ -93,6 +93,9 @@ fun LiveView(link: DesktopLink, workspace: Int, onClose: () -> Unit) {
         }
         LaunchedEffect(hint) { if (hint != null) { delay(1800); hint = null } }
 
+        // Opening can take a while: the computer waits out its own display hotplug handling first.
+        if (link.live == null) Text("OPENING DESKTOP…", color = T.inkFaint, fontFamily = Type.mono, fontSize = Type.fSmall,
+            letterSpacing = Type.trackMark, modifier = Modifier.align(Alignment.Center).testTag("live-opening"))
         link.live?.let { info ->
             Box(Modifier.align(Alignment.Center).aspectRatio(info.width.toFloat() / info.height)) {
                 key(info.port, info.width, info.height) { LiveSurface(info) }

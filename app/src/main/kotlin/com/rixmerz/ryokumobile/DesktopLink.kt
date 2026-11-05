@@ -51,7 +51,7 @@ class DesktopLink(private val port: Int = 7466) {
     /** Switches the computer's own monitor; the live view never does that. */
     fun switchTo(id: Int) = send(JSONObject().put("cmd", "workspace").put("id", id))
 
-    /** Asks for workspace [id] on the phone's headless output, sized like this screen. */
+    /** Asks for workspace [id] on the phone's headless output, in the aspect of this screen (the computer picks the exact size). */
     fun openView(id: Int, width: Int, height: Int) =
         send(JSONObject().put("cmd", "view").put("id", id).put("width", width).put("height", height))
 

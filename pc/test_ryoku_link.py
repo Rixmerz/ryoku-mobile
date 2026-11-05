@@ -5,25 +5,24 @@ import unittest
 from unittest import mock
 
 import ryoku_link
-import wl_pointer
 
 
 class WireFormat(unittest.TestCase):
     def test_message_roundtrip(self):
-        raw = wl_pointer.pack(7, 3, struct.pack("<I", 42)) + wl_pointer.pack(8, 1)
-        msgs, rest = wl_pointer.unpack(raw + b"\x01\x02")
+        raw = ryoku_link.pack(7, 3, struct.pack("<I", 42)) + ryoku_link.pack(8, 1)
+        msgs, rest = ryoku_link.unpack(raw + b"\x01\x02")
         self.assertEqual(msgs, [(7, 3, struct.pack("<I", 42)), (8, 1, b"")])
         self.assertEqual(rest, b"\x01\x02")
 
     def test_strings_are_nul_terminated_and_padded(self):
-        enc = wl_pointer._string("wl_output")  # 9 chars + NUL = 10 -> padded to 12
+        enc = ryoku_link._string("wl_output")  # 9 chars + NUL = 10 -> padded to 12
         self.assertEqual(struct.unpack_from("<I", enc)[0], 10)
         self.assertEqual(len(enc), 4 + 12)
-        self.assertEqual(wl_pointer._read_string(enc, 0), ("wl_output", len(enc)))
+        self.assertEqual(ryoku_link._read_string(enc, 0), ("wl_output", len(enc)))
 
     def test_short_message_is_rejected(self):
         with self.assertRaises(ValueError):
-            wl_pointer.unpack(struct.pack("<II", 1, 4 << 16))
+            ryoku_link.unpack(struct.pack("<II", 1, 4 << 16))
 
 
 class OutputSize(unittest.TestCase):
