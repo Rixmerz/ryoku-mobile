@@ -80,7 +80,7 @@ clients: set[asyncio.StreamWriter] = set()
 
 
 def log(msg: str) -> None:
-    print(f"ryoku-link: {msg}", file=sys.stderr, flush=True)
+    print(f"{time.strftime('%H:%M:%S')} ryoku-link: {msg}", file=sys.stderr, flush=True)
 
 
 def hyprctl(*args: str):
@@ -683,6 +683,8 @@ async def handle_video(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 async def on_command(writer: asyncio.StreamWriter, msg: dict) -> None:
     cmd = msg.get("cmd")
+    if cmd in ("view", "unview"):
+        log(f"phone asked: {cmd} {msg.get('id', '')}")
     if cmd == "workspace" and is_int(msg.get("id")):
         # Only plain numeric ids reach the dispatcher: the phone is not a shell.
         if view is not None:
