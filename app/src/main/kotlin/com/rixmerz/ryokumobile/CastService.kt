@@ -34,7 +34,8 @@ import kotlin.concurrent.thread
  *
  * After a send the phone's volume buttons turn the computer's volume until the session ends (see PcSession): the
  * service asks for key events for that and consumes only the two volume keys, and only during a session. The
- * button reads VOL meanwhile and a long-press on it ends the session.
+ * button reads VOL meanwhile and a long-press on it ends the session. A play/pause button under it toggles the
+ * PC player and shows only while a session runs.
  */
 class CastService : AccessibilityService() {
     private val ui = Handler(Looper.getMainLooper())
@@ -86,7 +87,7 @@ class CastService : AccessibilityService() {
     override fun onServiceConnected() {
         PcHandoff.say = ::say
         PcSession.showLevel = { say(it, PcSession.LEVEL_MS) }
-        PcSession.onChange = { ui.post { labelBubble() } }
+        PcSession.onChange = { ui.post { labelBubble(); refreshPlayButton() } }
     }
 
     /** Every key reaches this service; only the volume buttons of a PC session are taken, the rest is not ours. */
@@ -105,6 +106,7 @@ class CastService : AccessibilityService() {
         PcSession.onChange = null
         PcHandoff.say = null
         removeBubble()
+        removePlayButton()
         removeNotice()
         unwatchVideo()
         return super.onUnbind(intent)
@@ -185,6 +187,48 @@ class CastService : AccessibilityService() {
 
     private fun bubbleDescription() =
         if (PcSession.active) "Send this app to the PC again. Long-press to end PC volume control" else "Send this app to the PC"
+
+    private var playButton: View? = null
+
+    /** The play/pause button exists exactly while a PC session runs, under where the PC button sits. */
+    private fun refreshPlayButton() {
+        if (!PcSession.active) return removePlayButton()
+        if (playButton != null) return
+        val t = Tokens(signature)
+        val density = resources.displayMetrics.density
+        val size = (44 * density).toInt()
+        val view = TextView(this).apply {
+            text = "\u23EF"
+            textSize = 18f
+            gravity = Gravity.CENTER
+            setTextColor(t.ink.toArgb())
+            contentDescription = "Play or pause the video on the PC"
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(t.paper.toArgb())
+                setStroke((1 * density).toInt().coerceAtLeast(1), t.ink.toArgb())
+            }
+            alpha = 0.85f
+            setOnClickListener { PcSession.playPause() }
+        }
+        val lp = WindowManager.LayoutParams(
+            size, size, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            val screen = resources.displayMetrics
+            x = if (savedX >= 0) savedX else screen.widthPixels - size
+            y = (if (savedY >= 0) savedY else screen.heightPixels / 3) + size + (8 * density).toInt()
+        }
+        if (runCatching { getSystemService(WindowManager::class.java).addView(view, lp) }.isSuccess) playButton = view
+    }
+
+    private fun removePlayButton() {
+        val view = playButton ?: return
+        runCatching { getSystemService(WindowManager::class.java).removeView(view) }
+        playButton = null
+    }
 
     private fun labelBubble() {
         (bubble as? TextView)?.apply { text = bubbleText(); contentDescription = bubbleDescription() }

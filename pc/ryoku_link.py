@@ -40,6 +40,11 @@ JSON, the same for any future transport:
                    change the PC's default sink by 5 percentage points, never above 100%; answered to that
                    phone alone with {"type": "volume", "level": 40, "muted": false} or {"type": "volume", "error": "..."}
 
+  phone -> server  {"cmd": "playpause"}
+                   toggles playback of the PC player window the phone's video was sent to: that window is
+                   focused, confirmed focused, and given YouTube's `k` key; nothing is typed anywhere else.
+                   Answered to that phone alone with {"type": "playpause"} or {"type": "playpause", "error": "..."}
+
 State is pushed on every Hyprland event (window opened, workspace switched, ...), read from
 Hyprland's event socket, so the phone updates as the desktop changes.
 
@@ -207,7 +212,7 @@ def snapshot() -> dict:
         "type": "state",
         # What this bridge understands beyond the base protocol: a phone that wants one it lacks says so
         # instead of waiting for an answer an older bridge never gives.
-        "features": ["open_url", "open_video", "volume"],
+        "features": ["open_url", "open_video", "volume", "playpause"],
         "host": socket.gethostname(),
         "viewing": viewing,
         "workspaces": [
@@ -1481,6 +1486,47 @@ async def set_volume(writer: asyncio.StreamWriter, msg: dict) -> None:
     await reply(writer, {"type": "volume", "level": level, "muted": muted})
 
 
+# ---- Play/pause of the PC player ----
+#
+# The one player window (load_player) gets YouTube's `k` key, which toggles playback in fullscreen too. playerctl
+# is not used: the browser's MPRIS player is whichever tab last played, not necessarily the one the phone sent,
+# so only a key typed into the confirmed-focused player window is certain to reach the right video.
+
+PLAYPAUSE_KEY = ["wtype", "-k", "k"]
+
+
+class PlayerError(Exception):
+    pass
+
+
+def toggle_playback() -> None:
+    """Blocking: presses `k` in the player window. PlayerError (shown to the person) when the window is gone, focus
+    cannot be confirmed on it or the key could not be sent; nothing is typed then."""
+    address = load_player()
+    if address is None or not any(c["address"] == address for c in hyprctl("clients") or []):
+        raise PlayerError("the PC player window is gone")
+    dispatch(focus_window(address))
+    if not focus_confirmed(address):
+        raise PlayerError("could not focus the PC player")
+    try:
+        done = subprocess.run(PLAYPAUSE_KEY, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise PlayerError(f"could not run wtype ({getattr(e, 'strerror', None) or e})") from e
+    if done.returncode != 0:
+        raise PlayerError(f"wtype failed: {done.stderr.strip()}")
+
+
+async def play_pause(writer: asyncio.StreamWriter) -> None:
+    async with handoff_lock:  # never while a send is typing into the same window
+        try:
+            await asyncio.to_thread(toggle_playback)
+        except PlayerError as e:
+            log(f"playpause failed: {e}")
+            await reply(writer, {"type": "playpause", "error": str(e)})
+            return
+    await reply(writer, {"type": "playpause"})
+
+
 async def on_command(writer: asyncio.StreamWriter, msg: dict) -> None:
     cmd = msg.get("cmd")
     if cmd in ("view", "unview"):
@@ -1502,6 +1548,8 @@ async def on_command(writer: asyncio.StreamWriter, msg: dict) -> None:
         await open_video(writer, msg)
     elif cmd == "volume":
         await set_volume(writer, msg)
+    elif cmd == "playpause":
+        await play_pause(writer)
     elif cmd == "resolve_video":
         await asyncio.to_thread(warm_video, msg)
     elif view is not None and view.owner is writer:

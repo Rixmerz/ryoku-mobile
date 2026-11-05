@@ -50,6 +50,7 @@ object PcSession {
         seenPaused = controller?.playbackState?.state != PlaybackState.STATE_PLAYING
         levelShown = false
         link.onVolume = ::onVolume
+        link.onPlayPause = ::onPlayPause
         controller?.registerCallback(playbackChanged, Handler(Looper.getMainLooper()))
         watched = controller
         this.link = link
@@ -61,6 +62,7 @@ object PcSession {
         val ended = link ?: return
         link = null
         ended.onVolume = null
+        ended.onPlayPause = null
         watched?.unregisterCallback(playbackChanged)
         watched = null
         ended.stop()
@@ -83,6 +85,18 @@ object PcSession {
         }
         if (down) session.volume(step)
         return true
+    }
+
+    /** The play/pause button: toggles the PC player. A bridge that predates the request is told so instead of waiting. */
+    fun playPause() {
+        val session = link ?: return
+        if (!session.connected) return showLevel?.invoke("The PC is not reachable") ?: Unit
+        if (!session.canPlayPause) return showLevel?.invoke("The PC bridge is out of date: restart ryoku-link") ?: Unit
+        session.playPause()
+    }
+
+    private fun onPlayPause(error: String?) {
+        if (error != null) showLevel?.invoke("Play/pause failed: $error")
     }
 
     private fun onVolume(reply: VolumeReply) {

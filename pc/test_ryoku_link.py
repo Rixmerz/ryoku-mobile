@@ -983,6 +983,72 @@ class PcVolume(unittest.TestCase):
         self.assertIn("failed", sent[0]["error"])
 
 
+class PlayPause(unittest.TestCase):
+    """The play/pause button types `k` into the tracked player window only."""
+    ADDRESS = "0xa1"
+
+    def setUp(self):
+        self.file = os.path.join(tempfile.mkdtemp(), "ryoku-link", "player.json")
+        patch = mock.patch.object(ryoku_link, "PLAYER_FILE", self.file)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def command(self, clients, active, returncode=0):
+        sent, ran = [], []
+
+        async def fake_reply(writer, message):
+            sent.append(message)
+
+        def hypr(*args):
+            return {"clients": clients, "activewindow": {"address": active}}[args[0]]
+
+        def run(argv, **kw):
+            ran.append(argv)
+            return mock.Mock(returncode=returncode, stderr="no keyboard")
+
+        async def go():
+            with mock.patch.object(ryoku_link, "reply", fake_reply), mock.patch.object(ryoku_link, "hyprctl", hypr), \
+                    mock.patch.object(ryoku_link, "dispatch", lambda *lua: True), mock.patch.object(ryoku_link, "FOCUS_TIMEOUT", 0.2), \
+                    mock.patch.object(ryoku_link.subprocess, "run", run):
+                await ryoku_link.on_command(None, {"cmd": "playpause"})
+
+        asyncio.run(go())
+        return sent, ran
+
+    def test_k_is_typed_as_an_argv_list_once_the_player_is_focused(self):
+        ryoku_link.save_player(self.ADDRESS)
+        sent, ran = self.command([{"address": self.ADDRESS}], self.ADDRESS)
+        self.assertEqual(sent, [{"type": "playpause"}])
+        self.assertEqual(ran, [["wtype", "-k", "k"]])
+
+    def test_nothing_is_typed_when_another_window_has_focus(self):
+        ryoku_link.save_player(self.ADDRESS)
+        sent, ran = self.command([{"address": self.ADDRESS}], "0xb2")
+        self.assertEqual(ran, [])
+        self.assertEqual(sent[0]["type"], "playpause")
+        self.assertIn("focus", sent[0]["error"])
+
+    def test_a_gone_player_is_an_error_and_nothing_is_typed(self):
+        ryoku_link.save_player(self.ADDRESS)
+        for clients in ([], [{"address": "0xb2"}]):
+            sent, ran = self.command(clients, "0xb2")
+            self.assertEqual(sent, [{"type": "playpause", "error": "the PC player window is gone"}])
+            self.assertEqual(ran, [])
+
+    def test_no_remembered_player_is_an_error(self):
+        sent, ran = self.command([{"address": self.ADDRESS}], self.ADDRESS)
+        self.assertIn("gone", sent[0]["error"])
+        self.assertEqual(ran, [])
+
+    def test_a_wtype_failure_is_reported(self):
+        ryoku_link.save_player(self.ADDRESS)
+        sent, _ = self.command([{"address": self.ADDRESS}], self.ADDRESS, returncode=1)
+        self.assertIn("wtype failed", sent[0]["error"])
+
+    def test_the_bridge_announces_it(self):
+        self.assertIn("playpause", ryoku_link.snapshot()["features"])
+
+
 class FindingTheVideo(unittest.TestCase):
     """The phone reports title, channel, length and position; the bridge picks the video from a search."""
 

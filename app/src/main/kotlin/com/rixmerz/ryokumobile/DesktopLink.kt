@@ -65,6 +65,11 @@ class DesktopLink(private val port: Int = 7466) {
     /** Called, on this link's reader thread, with every answer to [volume]. */
     @Volatile var onVolume: ((VolumeReply) -> Unit)? = null
 
+    /** Same for `playpause`, the request the play/pause button sends during a PC session. */
+    var canPlayPause by mutableStateOf(false); private set
+    /** Called, on this link's reader thread, with the error of an [playPause] the computer could not do; null when it did. */
+    @Volatile var onPlayPause: ((String?) -> Unit)? = null
+
     private val io = Executors.newSingleThreadExecutor()
     private val sender = Executors.newSingleThreadExecutor()
     @Volatile private var socket: Socket? = null
@@ -130,6 +135,9 @@ class DesktopLink(private val port: Int = 7466) {
 
     /** Steps the computer's volume by [step] (1 or -1, five points each); the answer goes to [onVolume]. */
     fun volume(step: Int) = send(JSONObject().put("cmd", "volume").put("step", step))
+
+    /** Toggles playback of the player window the computer opened for the video; the answer goes to [onPlayPause]. */
+    fun playPause() = send(JSONObject().put("cmd", "playpause"))
 
     fun closeView() {
         live = null
@@ -261,6 +269,7 @@ class DesktopLink(private val port: Int = 7466) {
             "state" -> parseState(o)
             "view" -> parseView(o)
             "volume" -> onVolume?.invoke(VolumeReply(if (o.has("level")) o.getInt("level") else null, o.optBoolean("muted"), o.optString("error").ifEmpty { null }))
+            "playpause" -> onPlayPause?.invoke(o.optString("error").ifEmpty { null })
             "open_url" -> openUrlReply = OpenUrlReply(if (o.has("workspace")) o.getInt("workspace") else null, o.optString("error").ifEmpty { null })
         }
     }
@@ -286,6 +295,7 @@ class DesktopLink(private val port: Int = 7466) {
         canOpenUrl = "open_url" in features
         canOpenVideo = "open_video" in features
         canSetVolume = "volume" in features
+        canPlayPause = "playpause" in features
         connected = true
     }
 }
