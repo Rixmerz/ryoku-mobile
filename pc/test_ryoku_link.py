@@ -437,6 +437,7 @@ class CastAllowlist(unittest.TestCase):
             with mock.patch.object(ryoku_link, "reply", fake_reply), \
                     mock.patch.object(ryoku_link, "launch_cast", lambda p: launched.append(p) or ryoku_link.Cast(p, 7, "0x1", 3, None)), \
                     mock.patch.object(ryoku_link, "set_zoom", lambda z: None), \
+                    mock.patch.object(ryoku_link, "autoplay", lambda cast: None), \
                     mock.patch.object(ryoku_link, "casts", {}):
                 await ryoku_link.start_cast(None, package)
 
@@ -555,6 +556,9 @@ class CastCommand(unittest.TestCase):
         patcher = mock.patch.object(ryoku_link, "set_zoom", side_effect=lambda f: self.order.append(("zoom", f)) or True)
         self.set_zoom = patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(ryoku_link, "autoplay")
+        self.autoplay = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def run_cast(self, message, launch=None):
         writer = FakeCastWriter()
@@ -582,12 +586,6 @@ class CastCommand(unittest.TestCase):
         self.assertEqual(sent, [{"type": "cast", "package": "com.google.android.youtube", "error": "scrcpy is not installed on the computer"}])
         self.assertEqual(ryoku_link.casts, {})
 
-    def test_a_second_cast_of_the_same_app_is_refused(self):
-        ryoku_link.casts["com.google.android.youtube"] = ryoku_link.Cast("com.google.android.youtube", 8, "0x1", 3)
-        sent, launched = self.run_cast({"cmd": "cast", "package": "com.google.android.youtube"})
-        launched.assert_not_called()
-        self.assertEqual(sent, [{"type": "cast", "package": "com.google.android.youtube", "error": "already on the PC, workspace 8"}])
-
     def test_a_cast_ends_the_live_view_and_resets_the_zoom_before_launching(self):
         class Owner:
             pass
@@ -607,11 +605,6 @@ class CastCommand(unittest.TestCase):
     def test_a_cast_resets_the_zoom_even_without_a_live_view(self):
         self.run_cast({"cmd": "cast", "package": "com.google.android.youtube"}, mock.Mock(return_value=ryoku_link.Cast("com.google.android.youtube", 7, "0xabc", 3)))
         self.assertEqual(self.order, [("zoom", 1.0), "launch"])
-
-    def test_a_refused_duplicate_leaves_the_live_view_alone(self):
-        ryoku_link.casts["com.google.android.youtube"] = ryoku_link.Cast("com.google.android.youtube", 8, "0x1", 3)
-        self.run_cast({"cmd": "cast", "package": "com.google.android.youtube"})
-        self.assertEqual(self.order, [])
 
     def test_closing_the_window_forgets_the_cast(self):
         ryoku_link.casts["com.x.y"] = ryoku_link.Cast("com.x.y", 8, "0x1", 3)
@@ -652,8 +645,11 @@ class FakeScrcpy(unittest.TestCase):
         os.chmod(path, 0o755)
         return path
 
-    def scenario(self, directory, *, stub_text=None, stack=STACK_LIST, moved_stack=None):
+    def scenario(self, directory, *, stub_text=None, stack=STACK_LIST, moved_stack=None, leftover=False):
         calls, dispatched = [], []
+        window = {"title": "ryoku-cast com.google.android.youtube", "pid": 99, "address": "0xfeed", "workspace": {"id": 6}}
+        old_window = {"title": window["title"], "pid": 55, "address": "0xdead", "workspace": {"id": 3}}
+        gone = []  # leftover windows already closed
         displays = iter([DISPLAYS_BEFORE, DISPLAYS_AFTER, DISPLAYS_AFTER])
         stacks = iter([stack, moved_stack or stack.replace("displayId=0", "displayId=3", 1)])
 
@@ -670,15 +666,21 @@ class FakeScrcpy(unittest.TestCase):
             return ""
 
         def hypr(*args):
-            return {"workspaces": [{"id": i, "windows": 1} for i in (1, 2, 3, 4, 5)], "monitors": monitors(5),
-                    "clients": [{"title": "ryoku-cast com.google.android.youtube", "pid": 99, "address": "0xfeed", "workspace": {"id": 6}}]}[args[0]]
+            # The new window exists only once scrcpy was started; a leftover one only until it is signalled.
+            clients = ([window] if dispatched else []) + ([old_window] if leftover and not gone else [])
+            return {"workspaces": [{"id": i, "windows": 1} for i in (1, 2, 3, 4, 5)], "monitors": monitors(5), "clients": clients}[args[0]]
+
+        def kill(pid, sig):
+            calls.append(("kill", pid, sig))
+            if pid == 55:
+                gone.append(pid)
 
         stub = self.make_stub(directory, stub_text) if stub_text is not None else self.make_stub(directory)
         with mock.patch.object(ryoku_link, "SCRCPY", stub), mock.patch.object(ryoku_link, "adb", adb), \
                 mock.patch.object(ryoku_link, "hyprctl", hypr), mock.patch.object(ryoku_link, "SOCKET_DIR", directory), \
                 mock.patch.object(ryoku_link, "reverse_targets", return_value=["192.168.1.9:5555", "324751914997"]), \
                 mock.patch.object(ryoku_link, "dispatch", lambda *lua: dispatched.append(lua) or True), \
-                mock.patch.object(ryoku_link, "log"):
+                mock.patch.object(os, "kill", kill), mock.patch.object(ryoku_link, "log"):
             try:
                 cast = ryoku_link.launch_cast("com.google.android.youtube")
             except ryoku_link.CastError as e:
@@ -733,10 +735,256 @@ class FakeScrcpy(unittest.TestCase):
         dispatch.assert_not_called()
 
     def test_an_app_android_will_not_move_ends_the_scrcpy_window(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(os, "kill") as kill:
-            err, _, _ = self.scenario(tmp, moved_stack=STACK_LIST)  # still on display 0 after the move
+        with tempfile.TemporaryDirectory() as tmp:
+            err, calls, _ = self.scenario(tmp, moved_stack=STACK_LIST)  # still on display 0 after the move
         self.assertIn("would not move", str(err))
-        kill.assert_called_once_with(99, signal.SIGTERM)
+        self.assertIn(("kill", 99, signal.SIGTERM), calls)
+
+    def test_a_leftover_window_of_an_earlier_cast_is_closed_not_adopted(self):
+        # A bridge restart forgets its casts but not their windows: the new cast must not take the old
+        # window's address, and the old scrcpy (with its virtual display) must end.
+        with tempfile.TemporaryDirectory() as tmp:
+            cast, calls, _ = self.scenario(tmp, leftover=True)
+        self.assertEqual(cast.address, "0xfeed")
+        self.assertIn(("kill", 55, signal.SIGTERM), calls)
+        self.assertNotIn(("kill", 99, signal.SIGTERM), calls)
+
+
+YT = "com.google.android.youtube"
+# YouTube on the virtual display 3, the phone showing its own launcher.
+STACK_CAST_LIVE = """RootTask id=2102 bounds=[0,0][1920,1080] displayId=3 userId=0
+  taskId=2101: com.google.android.youtube/com.google.android.youtube.app.honeycomb.Shell$HomeActivity bounds=[0,0][1920,1080] userId=0 visible=true
+RootTask id=1 bounds=[0,0][2030,900] displayId=0 userId=0
+  taskId=2: com.zte.mifavor.launcher/com.android.launcher3.uioverrides.QuickstepLauncher bounds=[0,0][2030,900] userId=0 visible=true
+"""
+# Captured from the phone: YouTube went back to the phone (pinned) and the virtual display fell back to its launcher.
+STACK_CAST_LEFT = """RootTask id=2101 bounds=[1559,-82][1990,160] displayId=0 userId=0
+  taskId=2101: com.google.android.youtube/com.google.android.youtube.app.honeycomb.Shell$HomeActivity bounds=[1559,-82][1990,160] userId=0 visible=true
+RootTask id=2102 bounds=[0,0][1920,1080] displayId=3 userId=0
+  taskId=2103: com.zte.mifavor.launcher/com.android.launcher3.secondarydisplay.SecondaryDisplayLauncher bounds=[0,0][1920,1080] userId=0 visible=true
+"""
+STACK_CAST_EMPTY = "RootTask id=1 bounds=[0,0][2030,900] displayId=0 userId=0\n  taskId=2: com.zte.mifavor.launcher/.Launcher bounds=[0,0][1,1] userId=0 visible=true\n"
+MEDIA_SESSIONS = """  Sessions Stack - have 3 sessions:
+    package=com.android.server.telecom
+    state=null
+    package=com.google.android.youtube
+    state=PlaybackState {state=%s(3), position=0, buffered position=0, speed=1.0, updated=191055961, actions=8631, custom actions=[], active item id=-1, error=null}
+    package=org.telegram.messenger
+    state=PlaybackState {state=NONE(0), position=0, buffered position=0, speed=1.0, updated=174845600, actions=2477828, custom actions=[], active item id=-1, error=null}
+"""
+
+
+class PlaybackState(unittest.TestCase):
+    def test_the_state_is_the_one_of_the_apps_own_session(self):
+        self.assertEqual(ryoku_link.parse_playback_state(MEDIA_SESSIONS % "PAUSED", YT), "PAUSED")
+        self.assertEqual(ryoku_link.parse_playback_state(MEDIA_SESSIONS % "PLAYING", YT), "PLAYING")
+        self.assertEqual(ryoku_link.parse_playback_state(MEDIA_SESSIONS % "PLAYING", "org.telegram.messenger"), "NONE")
+
+    def test_no_session_or_no_state_is_none_never_a_neighbours_state(self):
+        self.assertIsNone(ryoku_link.parse_playback_state(MEDIA_SESSIONS % "PLAYING", "com.android.server.telecom"))  # state=null
+        self.assertIsNone(ryoku_link.parse_playback_state(MEDIA_SESSIONS % "PLAYING", "com.other.app"))
+        self.assertIsNone(ryoku_link.parse_playback_state("", YT))
+
+
+class FakePhone:
+    """adb for the cast health and playback checks: replies per command, records what was run."""
+
+    def __init__(self, stack=STACK_CAST_LIVE, displays=DISPLAYS_AFTER, states=("PLAYING",)):
+        self.stack, self.displays, self.calls = stack, displays, []
+        self.states = list(states)  # successive media session states; the last one repeats
+
+    def __call__(self, serial, *args, timeout=8):
+        self.calls.append(args)
+        if args[:3] == ("shell", "am", "stack"):
+            return self.stack
+        if args[:3] == ("shell", "dumpsys", "display"):
+            return self.displays
+        if args[:3] == ("shell", "dumpsys", "media_session"):
+            return MEDIA_SESSIONS % (self.states.pop(0) if len(self.states) > 1 else self.states[0])
+        return ""
+
+
+def a_cast(**kw):
+    return ryoku_link.Cast(YT, 6, "0xfeed", 3, kw.pop("previous", 5), "324751914997")
+
+
+class CastHealth(unittest.TestCase):
+    def problem(self, phone, window=True):
+        clients = [{"address": "0xfeed", "pid": 99}] if window else []
+        with mock.patch.object(ryoku_link, "adb", phone), mock.patch.object(ryoku_link, "hyprctl", lambda *a: clients):
+            return ryoku_link.cast_problem(a_cast())
+
+    def test_the_app_in_front_on_its_display_is_a_working_cast(self):
+        self.assertIsNone(self.problem(FakePhone()))
+
+    def test_the_front_task_of_a_display_is_found(self):
+        self.assertEqual(ryoku_link.top_package(STACK_CAST_LIVE, 3), YT)
+        self.assertEqual(ryoku_link.top_package(STACK_CAST_LIVE, 0), "com.zte.mifavor.launcher")
+        self.assertEqual(ryoku_link.top_package(STACK_CAST_LEFT, 3), "com.zte.mifavor.launcher")
+        self.assertIsNone(ryoku_link.top_package(STACK_CAST_LIVE, 9))
+
+    def test_the_app_leaving_the_display_for_the_phone_launcher_is_a_dead_cast(self):
+        # What the user saw: the PC window kept streaming the phone's home screen.
+        self.assertIn("com.zte.mifavor.launcher is in front", self.problem(FakePhone(stack=STACK_CAST_LEFT)))
+
+    def test_an_empty_display_a_missing_display_and_a_closed_window_are_dead_casts(self):
+        self.assertIn("nothing", self.problem(FakePhone(stack=STACK_CAST_EMPTY.replace("displayId=0", "displayId=7"))))
+        self.assertIn("virtual display is gone", self.problem(FakePhone(displays=DISPLAYS_BEFORE)))
+        self.assertIn("window is gone", self.problem(FakePhone(), window=False))
+
+    def test_an_adb_that_says_nothing_is_not_a_verdict(self):
+        with self.assertRaises(OSError):
+            self.problem(FakePhone(displays=""))
+
+
+class ResumePlayback(unittest.TestCase):
+    def resume(self, states):
+        phone = FakePhone(states=states)
+        with mock.patch.object(ryoku_link, "adb", phone), mock.patch.object(ryoku_link.time, "sleep"):
+            return ryoku_link.resume_playback("S", 3, YT, timeout=2.0), phone.calls
+
+    def test_a_paused_video_gets_play_on_its_display_until_the_session_says_playing(self):
+        ok, calls = self.resume(["PAUSED", "PAUSED", "PLAYING"])
+        self.assertTrue(ok)
+        self.assertIn(("shell", "input", "-d", "3", "keyevent", "126"), calls)  # play, never play/pause (85)
+        self.assertNotIn(("shell", "input", "-d", "3", "keyevent", "85"), calls)
+
+    def test_a_video_that_already_plays_is_left_alone(self):
+        ok, calls = self.resume(["PLAYING"])
+        self.assertTrue(ok)
+        self.assertFalse([c for c in calls if "keyevent" in c])
+
+    def test_no_session_means_no_key_press_and_no_claim_of_playing(self):
+        phone = FakePhone()
+        with mock.patch.object(ryoku_link, "adb", phone), mock.patch.object(ryoku_link, "playback_state", lambda s, p: None), \
+                mock.patch.object(ryoku_link.time, "sleep"):
+            self.assertFalse(ryoku_link.resume_playback("S", 3, YT, timeout=0.0))
+        self.assertFalse([c for c in phone.calls if "keyevent" in c])  # the key would start whatever played last
+
+    def test_a_video_that_never_resumes_is_reported_not_playing(self):
+        ok, _ = self.resume(["PAUSED"])
+        self.assertFalse(ok)
+
+
+class CastRecovery(unittest.TestCase):
+    """A dead cast is ended and never blocks the next one; a live one is reused."""
+
+    def setUp(self):
+        self.addCleanup(ryoku_link.casts.clear)
+        self.events = []
+        for name, fake in (("log", lambda m: None), ("set_zoom", lambda z: self.events.append(("zoom", z)) or True),
+                           ("autoplay", lambda c: self.events.append(("autoplay", c.package))),
+                           ("dispatch", lambda *lua: self.events.append(("dispatch", lua)) or True),
+                           ("close_cast_window", lambda address: self.events.append(("close", address)))):
+            patcher = mock.patch.object(ryoku_link, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_cast(self, problem, launch=None):
+        sent = []
+
+        async def reply(writer, message):
+            sent.append(message)
+
+        ryoku_link.casts[YT] = a_cast()
+        launch = launch or (lambda package: self.events.append(("launch", package)) or ryoku_link.Cast(package, 7, "0xnew", 4, 5, "S"))
+        with mock.patch.object(ryoku_link, "reply", reply), mock.patch.object(ryoku_link, "cast_problem", lambda cast: problem(cast)), \
+                mock.patch.object(ryoku_link, "launch_cast", launch), \
+                mock.patch.object(ryoku_link, "window_at", lambda address: {"address": address, "workspace": {"id": 9}}), \
+                mock.patch.object(ryoku_link, "hyprctl", lambda *a: monitors(6)):
+            asyncio.run(ryoku_link.start_cast(None, YT))
+        return sent
+
+    def test_a_dead_cast_is_cleaned_up_and_the_new_send_goes_through(self):
+        sent = self.run_cast(lambda cast: "nothing is in front on the virtual display, not the app")
+        self.assertEqual(sent, [{"type": "cast", "package": YT, "workspace": 7}])  # not "already on the PC"
+        self.assertEqual(ryoku_link.casts[YT].address, "0xnew")
+        names = [e if isinstance(e, str) else e[0] for e in self.events]
+        self.assertLess(names.index("close"), names.index("launch"))  # the old scrcpy is closed first
+
+    def test_a_phone_that_cannot_be_reached_does_not_keep_a_dead_cast_alive(self):
+        def unreachable(cast):
+            raise OSError("adb offline")
+        self.run_cast(unreachable)
+        self.assertEqual(ryoku_link.casts[YT].address, "0xnew")
+
+    def test_a_live_cast_is_focused_and_reused_not_refused_and_not_relaunched(self):
+        launched = []
+        sent = self.run_cast(lambda cast: None, launch=lambda package: launched.append(package))
+        self.assertEqual(launched, [])
+        self.assertEqual(sent, [{"type": "cast", "package": YT, "workspace": 9}])  # where the window is now
+        self.assertEqual(ryoku_link.casts[YT].address, "0xfeed")
+        self.assertIn(("dispatch", (ryoku_link.focus_workspace(9), ryoku_link.focus_window("0xfeed"))), self.events)
+        self.assertIn(("autoplay", YT), self.events)  # reusing it also makes sure the video plays
+        self.assertNotIn(("close", "0xfeed"), self.events)
+
+    def test_ending_a_cast_closes_the_window_returns_the_pc_and_resets_the_zoom(self):
+        cast = a_cast()
+        ryoku_link.casts[YT] = cast
+        with mock.patch.object(ryoku_link, "hyprctl", lambda *a: monitors(6)):
+            asyncio.run(ryoku_link.end_cast(cast, "test"))
+        self.assertEqual(ryoku_link.casts, {})
+        self.assertEqual(self.events, [("close", "0xfeed"), ("dispatch", (ryoku_link.focus_monitor("eDP-1"), ryoku_link.focus_workspace(5))), ("zoom", 1.0)])
+
+
+class WatchCasts(unittest.TestCase):
+    """watch_casts ends a cast after CAST_MISSES bad checks in a row, never on one."""
+
+    def setUp(self):
+        self.addCleanup(ryoku_link.casts.clear)
+        self.ended = []
+
+        async def end_cast(cast, reason):
+            self.ended.append(reason)
+            ryoku_link.casts.pop(cast.package, None)
+
+        for name, fake in (("log", lambda m: None), ("end_cast", end_cast)):
+            patcher = mock.patch.object(ryoku_link, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def watch(self, answers, polls):
+        """Runs `polls` rounds of the watcher; `answers` are the successive cast_problem results (an exception is raised)."""
+        ryoku_link.casts[YT] = a_cast()
+        answers = list(answers)
+
+        def problem(cast):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        async def go():
+            real_sleep = asyncio.sleep
+            rounds = []
+
+            async def sleep(_):
+                rounds.append(1)
+                if len(rounds) > polls:
+                    raise asyncio.CancelledError
+                await real_sleep(0)
+
+            with mock.patch.object(ryoku_link, "cast_problem", problem), mock.patch.object(ryoku_link.asyncio, "sleep", sleep):
+                try:
+                    await ryoku_link.watch_casts()
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(go())
+
+    def test_two_bad_checks_in_a_row_end_the_cast(self):
+        self.watch(["launcher is in front", "launcher is in front"], polls=2)
+        self.assertEqual(self.ended, ["launcher is in front"])
+
+    def test_one_bad_check_between_good_ones_does_not(self):
+        self.watch([None, "launcher is in front", None, "launcher is in front"], polls=4)
+        self.assertEqual(self.ended, [])
+        self.assertIn(YT, ryoku_link.casts)
+
+    def test_an_unreachable_phone_is_not_a_dead_cast(self):
+        self.watch([OSError("adb offline")] * 3, polls=3)
+        self.assertEqual(self.ended, [])
+        self.assertIn(YT, ryoku_link.casts)
 
 
 if __name__ == "__main__":

@@ -862,9 +862,14 @@ class CastError(Exception):
 
 
 class Cast:
-    def __init__(self, package: str, workspace: int, address: str, display: int, previous: int | None = None):
+    def __init__(self, package: str, workspace: int, address: str, display: int, previous: int | None = None,
+                 serial: str | None = None):
         self.package, self.workspace, self.address, self.display = package, workspace, address, display
         self.previous = previous  # the workspace the PC monitor showed before the cast; None: unknown
+        self.serial = serial  # the phone's adb serial, for the health checks
+        self.misses = 0  # consecutive failed health checks (see watch_casts)
+        self.recoveries = 0  # times a frozen picture made the bridge cast this app again
+        self.log_path: str | None = None  # scrcpy's output; --print-fps keeps it moving while frames arrive
 
 
 def valid_package(value) -> bool:
@@ -979,6 +984,78 @@ def window_titled(title: str) -> dict | None:
     return next((c for c in hyprctl("clients") or [] if c.get("title") == title), None)
 
 
+def window_at(address: str) -> dict | None:
+    return next((c for c in hyprctl("clients") or [] if c.get("address") == address), None)
+
+
+def top_package(stack_list: str, display: int) -> str | None:
+    """The package of the front-most task on `display` (`am stack list` puts it first), None when empty."""
+    return next((pkg for _, shown_on, pkg in parse_stack_list(stack_list) if shown_on == display), None)
+
+
+def parse_playback_state(media_session: str, package: str) -> str | None:
+    """The playback state name (PLAYING, PAUSED, ...) of `package`'s media session in
+    `dumpsys media_session`, None when it has no session or the session reports no state."""
+    current = None
+    for line in media_session.splitlines():
+        if m := re.match(r"\s*package=(\S+)", line):
+            current = m[1]
+        elif current == package and (m := re.match(r"\s*state=PlaybackState \{state=(\w+)\(", line)):
+            return m[1]
+    return None
+
+
+def playback_state(serial: str, package: str) -> str | None:
+    return parse_playback_state(adb(serial, "shell", "dumpsys", "media_session"), package)
+
+
+def cast_problem(cast: Cast) -> str | None:
+    """Why `cast` is no longer a working cast, None while it is. Blocking; adb failures propagate and
+    mean "could not tell", never "dead". A cast works while its window exists, its virtual display
+    exists and the app is the front-most task on that display: anything else on the display (the phone's
+    launcher, when the app was closed, finished or moved back) is what the PC window would show."""
+    if window_at(cast.address) is None:
+        return "its window is gone"
+    displays = adb(cast.serial, "shell", "dumpsys", "display")
+    if not displays.strip():
+        raise OSError("adb returned no display list")
+    if cast.display not in parse_displays(displays):
+        return "its virtual display is gone"
+    top = top_package(adb(cast.serial, "shell", "am", "stack", "list"), cast.display)
+    if top != cast.package:
+        return f"{top or 'nothing'} is in front on the virtual display, not the app"
+    return None
+
+
+def close_cast_window(address: str) -> None:
+    """Ends scrcpy, and with it the virtual display, by signalling the process of the window at `address`.
+    Waits for the window to go; a scrcpy that ignores SIGTERM is killed."""
+    for sig, wait in ((signal.SIGTERM, 4.0), (signal.SIGKILL, 2.0)):
+        window = window_at(address)
+        if window is None:
+            return
+        if window.get("pid"):
+            try:
+                os.kill(window["pid"], sig)
+            except ProcessLookupError:
+                pass  # it exited between the lookup and the signal: the goal
+        poll(lambda: window_at(address) is None, wait, interval=0.2)
+
+
+def resume_playback(serial: str, display: int, package: str, timeout: float = 12.0) -> bool:
+    """Presses play until the app's media session says PLAYING; True once it does. Blocking.
+    KEYCODE_MEDIA_PLAY (126), never PLAY_PAUSE, so an already playing video is not paused. It is only
+    pressed for a session that is paused or stopped: with no session Android would hand the key to
+    whatever media app played last."""
+    def settle() -> bool:
+        state = playback_state(serial, package)
+        if state in ("PAUSED", "STOPPED"):
+            adb(serial, "shell", "input", "-d", str(display), "keyevent", "126")
+            state = poll(lambda: playback_state(serial, package) == "PLAYING" and "PLAYING", 2.0, 0.4)
+        return state == "PLAYING"
+    return bool(poll(settle, timeout, interval=0.5))
+
+
 def launch_cast(package: str) -> Cast:
     """Blocking: opens the scrcpy window and moves the app onto its display."""
     if not SCRCPY:
@@ -1002,6 +1079,11 @@ def launch_cast(package: str) -> Cast:
     previous = pc_workspace(pc_monitors)
     workspace = free_workspace(hyprctl("workspaces") or [], pc_monitors)
     title = cast_title(package)
+    # Whatever still wears this title is a leftover (a bridge restart forgets its casts): adopting its
+    # window would mistake it for the new one, and it keeps a dead virtual display open.
+    for leftover in [c for c in hyprctl("clients") or [] if c.get("title") == title]:
+        log(f"closing a leftover cast window ({leftover.get('address')})")
+        close_cast_window(leftover["address"])
     log_path = os.path.join(SOCKET_DIR, f"cast-{package}.log")
     display_spec = cast_display(phone_density(adb(serial, "shell", "wm", "density")))
     argv = scrcpy_argv(SCRCPY, serial, title, KEEP_APPS_FLAG in help_text, display_spec)
@@ -1029,7 +1111,8 @@ def launch_cast(package: str) -> Cast:
         if (w := window_titled(title)) and w.get("pid"):
             os.kill(w["pid"], signal.SIGTERM)  # tears the virtual display down with it
         raise
-    cast = Cast(package, window["workspace"]["id"], window["address"], display, previous)
+    cast = Cast(package, window["workspace"]["id"], window["address"], display, previous, serial)
+    cast.log_path = log_path
     if not dispatch(*show_cast(cast)):
         log(f"cast {package}: could not switch the PC to workspace {cast.workspace}")
     return cast
@@ -1037,6 +1120,29 @@ def launch_cast(package: str) -> Cast:
 
 casts: dict[str, Cast] = {}
 cast_lock = asyncio.Lock()  # the new display is found by diffing, so one cast starts at a time
+CAST_POLL = 2.0  # seconds between health checks of the live casts
+CAST_MISSES = 2  # consecutive failed checks before a cast is ended: a task switch passes through odd states
+
+
+async def return_pc(ended: list[Cast]) -> None:
+    """Sends the PC back to where it was before the cast (once: it cannot return to two places) and
+    resets the screen zoom, which would otherwise be left on whatever the PC shows next."""
+    monitors = await asyncio.to_thread(hyprctl, "monitors") or []
+    for cast in ended:
+        if steps := return_steps(cast, monitors):
+            await asyncio.to_thread(dispatch, *steps)
+            break
+    await asyncio.to_thread(set_zoom, 1.0)
+
+
+async def end_cast(cast: Cast, reason: str) -> None:
+    """Ends a cast: closes its window (which tears the virtual display down), forgets it and returns the PC.
+    The caller holds cast_lock."""
+    if casts.get(cast.package) is cast:
+        del casts[cast.package]
+    log(f"cast {cast.package} ended: {reason}")
+    await asyncio.to_thread(close_cast_window, cast.address)
+    await return_pc([cast])
 
 
 async def start_cast(writer: asyncio.StreamWriter, package: str) -> None:
@@ -1044,9 +1150,23 @@ async def start_cast(writer: asyncio.StreamWriter, package: str) -> None:
         await reply(writer, {"type": "cast", "package": package, "error": "only YouTube can be sent to the PC for now"})
         return
     async with cast_lock:
-        if package in casts:
-            await reply(writer, {"type": "cast", "package": package, "error": f"already on the PC, workspace {casts[package].workspace}"})
-            return
+        if existing := casts.get(package):
+            # A cast the bridge still remembers is reused when it works and cleaned up when it does not:
+            # a dead one must never answer "already busy" to the next Send to PC.
+            try:
+                problem = await asyncio.to_thread(cast_problem, existing)
+            except (OSError, ValueError, subprocess.SubprocessError) as e:
+                problem = f"the phone could not be reached ({e})"
+            if problem is None:
+                window = await asyncio.to_thread(window_at, existing.address)
+                if window:
+                    existing.workspace = window["workspace"]["id"]
+                await asyncio.to_thread(dispatch, *show_cast(existing))
+                log(f"cast {package}: already live on workspace {existing.workspace}, focused it")
+                await reply(writer, {"type": "cast", "package": package, "workspace": existing.workspace})
+                await asyncio.to_thread(autoplay, existing)
+                return
+            await end_cast(existing, problem)
         # The phone is leaving for the app: a live view (its headless output, a pulled workspace, a
         # screen zoom) must not be left on the PC next to the cast, nor shift which workspace is free.
         if view is not None:
@@ -1061,6 +1181,17 @@ async def start_cast(writer: asyncio.StreamWriter, package: str) -> None:
         casts[package] = cast
         log(f"cast {package}: virtual display {cast.display}, PC workspace {cast.workspace}")
         await reply(writer, {"type": "cast", "package": package, "workspace": cast.workspace})
+        await asyncio.to_thread(autoplay, cast)
+
+
+def autoplay(cast: Cast) -> None:
+    """Moving the task pauses the video: resume it and say whether it is playing. Blocking."""
+    try:
+        playing = resume_playback(cast.serial, cast.display, cast.package)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"cast {cast.package}: could not resume playback ({e})")
+        return
+    log(f"cast {cast.package}: {'playing' if playing else 'not playing (paused, or no playback to resume)'}")
 
 
 async def reap_casts() -> None:
@@ -1071,13 +1202,28 @@ async def reap_casts() -> None:
     ended = [cast for cast in casts.values() if cast.address not in open_windows]
     for cast in ended:
         del casts[cast.package]
-        log(f"cast {cast.package} ended")
+        log(f"cast {cast.package} ended: its window was closed")
     if ended:
-        monitors = await asyncio.to_thread(hyprctl, "monitors") or []
-        for cast in ended:
-            if steps := return_steps(cast, monitors):
-                await asyncio.to_thread(dispatch, *steps)
-                break  # one trip back: the PC cannot return to two places
+        await return_pc(ended)
+
+
+async def watch_casts() -> None:
+    """Ends a cast that stopped working, so the PC never keeps showing the phone's launcher and the
+    next Send to PC is never refused by a cast nobody uses. Needs CAST_MISSES bad checks in a row."""
+    while True:
+        await asyncio.sleep(CAST_POLL)
+        for cast in list(casts.values()):
+            async with cast_lock:
+                if casts.get(cast.package) is not cast:
+                    continue
+                try:
+                    problem = await asyncio.to_thread(cast_problem, cast)
+                except (OSError, ValueError, subprocess.SubprocessError) as e:
+                    log(f"cast {cast.package}: health check failed ({e})")
+                    continue  # could not tell: the cast stays until adb answers
+                cast.misses = cast.misses + 1 if problem else 0
+                if problem and cast.misses >= CAST_MISSES:
+                    await end_cast(cast, problem)
 
 
 async def handle_video(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -1240,7 +1386,7 @@ async def main() -> None:
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, stop.set)
-    work = asyncio.gather(server.serve_forever(), video.serve_forever(), watch_hyprland(), keep_reverse())
+    work = asyncio.gather(server.serve_forever(), video.serve_forever(), watch_hyprland(), keep_reverse(), watch_casts())
     waiter = asyncio.ensure_future(stop.wait())
     try:
         done, _ = await asyncio.wait({work, waiter}, return_when=asyncio.FIRST_COMPLETED)

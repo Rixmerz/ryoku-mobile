@@ -6,6 +6,7 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
+import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -23,8 +24,9 @@ import kotlin.concurrent.thread
  * delivers multi-finger gestures in touch-exploration mode, where every single tap turns into
  * explore-by-touch for the whole phone.
  *
- * The button sits on the edge of any app that has a launcher entry, hides on the home screen, and
- * tapping it asks the computer (pc/ryoku_link.py) to take the app in front. Drag it to move it.
+ * The button sits on the edge of the screen only while a sendable app (YouTube for now) is in front; it
+ * is hidden on the home screen, in this app and in every other app. Tapping it asks the computer
+ * (pc/ryoku_link.py) to take the app in front. Drag it to move it.
  */
 class CastService : AccessibilityService() {
     private val ui = Handler(Looper.getMainLooper())
@@ -42,16 +44,31 @@ class CastService : AccessibilityService() {
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         val pkg = event.packageName?.toString() ?: return
         when {
-            // The button's own window reports itself as this package too: it must not hide itself.
-            pkg == packageName && event.className != LauncherActivity::class.java.name -> return
-            // Home screens (ours included) are not apps to send; the button goes away there.
+            // The button's own overlay windows report themselves as this package too (a plain view class,
+            // never an activity): they must not hide the button.
+            pkg == packageName && event.className?.startsWith("android.") == true -> return
+            // A cast app shown on the computer's virtual display reports its windows here as well; it is
+            // not what the phone's screen shows, so it must not bring the button up over the home screen.
+            !onPhoneScreen(event) -> return
+            // Only a sendable app in front shows the button. The home screen, this app and every other
+            // app with a launcher entry hide it.
+            pkg in CASTABLE -> front = pkg
             pkg == packageName || pkg in homePackages() -> front = null
-            // Only apps with a launcher entry count: the shade, the keyboard and system dialogs
-            // pass through here too, and the app underneath stays the one in front.
-            packageManager.getLaunchIntentForPackage(pkg) != null -> front = pkg
+            // The shade, the keyboard and system dialogs pass through here too, and the app underneath
+            // stays the one in front; anything with a launcher entry is a different app in front.
+            packageManager.getLaunchIntentForPackage(pkg) != null -> front = null
             else -> return
         }
         refreshBubble()
+    }
+
+    /** False when the event's window is on another display than the phone's own (a virtual display). */
+    private fun onPhoneScreen(event: AccessibilityEvent): Boolean {
+        val displays = windowsOnAllDisplays
+        for (i in 0 until displays.size()) {
+            if (displays.valueAt(i).any { it.id == event.windowId }) return displays.keyAt(i) == Display.DEFAULT_DISPLAY
+        }
+        return true // window already gone: assume the phone's screen, as the service always did
     }
 
     override fun onInterrupt() = Unit
@@ -147,7 +164,7 @@ class CastService : AccessibilityService() {
                 if (!link.castable) return@thread say("The PC bridge is out of date: restart ryoku-link on the computer")
                 link.cast(pkg)
                 // The computer waits up to ~25 s for scrcpy to open its window.
-                if (!waitFor(35_000) { link.castReply != null }) return@thread say("The computer did not answer")
+                if (!waitFor(45_000) { link.castReply != null }) return@thread say("The computer did not answer")
                 val reply = link.castReply!!
                 say(if (reply.workspace != null) "Sent to the PC, desktop ${reply.workspace}" else "Could not send: ${reply.error}")
             } finally {
