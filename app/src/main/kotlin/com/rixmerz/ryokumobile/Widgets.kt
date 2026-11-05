@@ -359,7 +359,7 @@ private fun DesktopPage(link: DesktopLink, onView: (Int) -> Unit) {
         Spacer(Modifier.width(Geo.s2))
         Text(link.host.uppercase(), color = T.inkFaint, fontFamily = Type.mono, fontSize = Type.fSmall,
             maxLines = 1, modifier = Modifier.padding(bottom = 4.dp).weight(1f))
-        Eyebrow("USB", T.inkFaint)
+        Eyebrow(if (link.wifiHost == null) "USB" else "WI-FI", T.inkFaint)
     }
     Text("TAP · VIEW      HOLD · SWITCH PC", color = T.inkFaint, fontFamily = Type.mono, fontSize = Type.fTiny, letterSpacing = Type.trackLabel)
     Spacer(Modifier.height(Geo.s2))

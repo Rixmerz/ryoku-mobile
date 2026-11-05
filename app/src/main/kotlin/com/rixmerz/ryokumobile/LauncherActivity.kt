@@ -1,5 +1,6 @@
 package com.rixmerz.ryokumobile
 
+
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -101,7 +102,7 @@ class LauncherActivity : ComponentActivity() {
         })
         val prefs = LauncherPrefs(this)
         tweaks.attach()
-        link.start()
+        link.start(this)
         setContent {
             val tokens = remember(prefs.scheme) { Tokens(schemeById(prefs.scheme)) }
             CompositionLocalProvider(LocalTokens provides tokens) {

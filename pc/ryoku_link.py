@@ -19,6 +19,8 @@ JSON, the same for any future transport:
   phone -> server  {"cmd": "pointer", "action": "move"|"down"|"up", "x": 0..1, "y": 0..1,
                     "button": "left"|"right"|"middle"}
   phone -> server  {"cmd": "scroll", "dx": lines, "dy": lines, "end": bool}
+  phone -> server  {"cmd": "zoom", "factor": 1..8, "x": 0..1, "y": 0..1}
+                   zoom the PC's screen about that point of the viewed output (factor 1 = off)
   phone -> server  {"cmd": "key", "text": "abc"} or {"cmd": "key", "key": "Return", "mods": ["ctrl"]}
 
 State is pushed on every Hyprland event (window opened, workspace switched, ...), read from
@@ -100,6 +102,24 @@ def dispatch(*lua: str) -> bool:
     for l in problems:
         log(f"hyprctl: {l}")
     return not problems
+
+
+MAX_ZOOM = 8.0
+
+
+def clamp_zoom(factor: float) -> float:
+    return min(max(float(factor), 1.0), MAX_ZOOM)
+
+
+def set_zoom(factor: float) -> bool:
+    """Hyprland's own screen zoom (`cursor:zoom_factor`, 1.0 = off). It is global and follows the
+    cursor, so it magnifies whichever output the cursor is on. This Hyprland is configured through
+    Lua, where `hyprctl keyword` is refused: the option goes through `hl.config`."""
+    out = subprocess.run(["hyprctl", "eval", f"hl.config({{ cursor = {{ zoom_factor = {clamp_zoom(factor):.3f} }} }})"],
+                         capture_output=True, text=True, timeout=3).stdout.strip()
+    if out != "ok":
+        log(f"hyprctl: could not set the zoom: {out}")
+    return out == "ok"
 
 
 def focus_monitor(name: str) -> str:
@@ -389,6 +409,7 @@ class PhoneView:
         self.rest: tuple[str, float | None, float | None] | None = None
         self.pressed: set[str] = set()
         self.last_input = 0.0
+        self.zoomed_ws: int | None = None  # the workspace the PC screen is zoomed on; None: not zoomed
 
     # ---- output lifecycle (blocking: run in a thread) ----
 
@@ -439,6 +460,7 @@ class PhoneView:
         log("ryoku-monitor autoscale still running after 25 s; sizing the output anyway")
 
     def close(self) -> None:
+        self.reset_zoom()
         if self.pointer:
             self.pointer.close()
             self.pointer = None
@@ -585,7 +607,10 @@ class PhoneView:
             old, self.pointer, self.pointer_on = self.pointer, fresh, self.source
             self.pressed.clear()
             old.close()
-        return self.look() != before
+        changed = self.look() != before
+        if self.zoomed_ws is not None and (changed or self.zoomed_ws != self.ws):
+            self.reset_zoom()  # the zoom belonged to another picture
+        return changed
 
     def release(self) -> None:
         """Returns the workspace the phone is looking at to its home monitor."""
@@ -629,6 +654,27 @@ class PhoneView:
             self.pointer.scroll(dx, dy)
         if msg.get("end") is True:
             self.pointer.scroll_end()
+
+    def zoom_event(self, msg: dict) -> None:
+        """Mirrors the phone's pinch on the PC screen, for an audience watching it. Hyprland zooms
+        about the cursor, so the pointer is first put on the zoom centre."""
+        factor, x, y = msg.get("factor"), msg.get("x"), msg.get("y")
+        if not (is_number(factor) and is_number(x) and is_number(y)):
+            return
+        if clamp_zoom(factor) <= 1.005:
+            self.reset_zoom()
+            return
+        if self.pointer is None:
+            return
+        self._touch()
+        self.pointer.move_to(x, y)
+        if set_zoom(factor):
+            self.zoomed_ws = self.ws
+
+    def reset_zoom(self) -> None:
+        if self.zoomed_ws is not None:
+            self.zoomed_ws = None
+            set_zoom(1.0)
 
     def key_event(self, msg: dict) -> None:
         text, key = msg.get("text"), msg.get("key")
@@ -804,6 +850,8 @@ async def on_command(writer: asyncio.StreamWriter, msg: dict) -> None:
             view.pointer_event(msg)
         elif cmd == "scroll":
             view.scroll_event(msg)
+        elif cmd == "zoom":
+            await asyncio.to_thread(view.zoom_event, msg)
         elif cmd == "key":
             await asyncio.to_thread(view.key_event, msg)
 

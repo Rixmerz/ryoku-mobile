@@ -199,6 +199,63 @@ class Input(unittest.TestCase):
         self.assertIsNone(self.wtype_argv({"key": "-M"}))
 
 
+class Zoom(unittest.TestCase):
+    def setUp(self):
+        self.view = ryoku_link.PhoneView(None, 1080, 2400)
+        self.view.pointer = mock.Mock()
+        self.view.remember_pc = mock.Mock()
+        self.view.ws = 6
+        self.real_set_zoom = ryoku_link.set_zoom
+        patch = mock.patch.object(ryoku_link, "set_zoom", return_value=True)
+        self.set_zoom = patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_zoom_centres_the_pointer_then_zooms(self):
+        self.view.zoom_event({"factor": 2.5, "x": 0.3, "y": 0.7})
+        self.view.pointer.move_to.assert_called_once_with(0.3, 0.7)
+        self.set_zoom.assert_called_once_with(2.5)
+        self.assertEqual(self.view.zoomed_ws, 6)
+
+    def test_factor_is_clamped_to_the_supported_range(self):
+        self.assertEqual(ryoku_link.clamp_zoom(100), ryoku_link.MAX_ZOOM)
+        self.assertEqual(ryoku_link.clamp_zoom(0.2), 1.0)
+        with mock.patch.object(ryoku_link.subprocess, "run", return_value=mock.Mock(stdout="ok\n")) as run:
+            self.real_set_zoom(100)
+        self.assertIn("zoom_factor = 8.000", run.call_args.args[0][-1])
+
+    def test_bad_zoom_messages_are_dropped(self):
+        for bad in ({"factor": "2", "x": 0, "y": 0}, {"factor": float("nan"), "x": 0, "y": 0},
+                    {"factor": 2, "x": None, "y": 0}, {"factor": True, "x": 0, "y": 0}, {}):
+            self.view.zoom_event(bad)
+        self.set_zoom.assert_not_called()
+        self.view.pointer.move_to.assert_not_called()
+
+    def test_factor_one_switches_the_zoom_off(self):
+        self.view.zoom_event({"factor": 3, "x": 0.5, "y": 0.5})
+        self.view.zoom_event({"factor": 1.0, "x": 0.5, "y": 0.5})
+        self.assertEqual(self.set_zoom.call_args_list[-1], mock.call(1.0))
+        self.assertIsNone(self.view.zoomed_ws)
+
+    def test_nothing_is_reset_when_never_zoomed(self):
+        self.view.reset_zoom()
+        self.set_zoom.assert_not_called()
+
+    def test_closing_the_view_resets_the_zoom(self):
+        self.view.zoom_event({"factor": 3, "x": 0.5, "y": 0.5})
+        with mock.patch.object(ryoku_link, "dispatch"), mock.patch.object(ryoku_link, "hyprctl", return_value=[]), \
+                mock.patch.object(ryoku_link.subprocess, "run"):
+            self.view.close()
+        self.assertEqual(self.set_zoom.call_args_list[-1], mock.call(1.0))
+
+    def test_changing_workspace_resets_the_zoom(self):
+        self.view.zoom_event({"factor": 3, "x": 0.5, "y": 0.5})
+        self.view.ws = 4
+        with mock.patch.object(ryoku_link, "hyprctl", fake_hyprctl(monitors(6, 4), [{"id": 6, "monitor": "eDP-1"}])), \
+                mock.patch.object(ryoku_link, "dispatch", return_value=True), mock.patch.object(ryoku_link, "VirtualPointer"):
+            self.view.apply()
+        self.assertEqual(self.set_zoom.call_args_list[-1], mock.call(1.0))
+
+
 class PrivateSocket(unittest.TestCase):
     def test_socket_is_owner_only_and_a_second_instance_is_refused(self):
         async def scenario(directory):

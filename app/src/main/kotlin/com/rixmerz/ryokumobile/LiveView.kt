@@ -1,5 +1,13 @@
 package com.rixmerz.ryokumobile
 
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
+import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.draw.clipToBounds
 import android.app.Activity
 import android.content.pm.ActivityInfo
 import android.graphics.SurfaceTexture
@@ -62,7 +70,9 @@ import kotlin.math.abs
  * Gestures, chosen so none collides with another:
  *  - one finger: tap clicks, hold (long press) right-clicks, moving drags with the left button;
  *  - two fingers, vertical: scroll;
- *  - two fingers, horizontal, a quarter of the width: previous / next desktop.
+ *  - two fingers, horizontal, a quarter of the width: previous / next desktop;
+ *  - two fingers spreading or pinching: zoom the picture on the phone (and pan while zoomed).
+ * Zoom is local, the desktop never changes size; touches are mapped back through it.
  * The workspace switch is a two-finger swipe because an edge swipe is the system's back gesture
  * and one finger is the drag; the price is that a two-finger *horizontal* scroll does not exist.
  */
@@ -73,6 +83,8 @@ fun LiveView(link: DesktopLink, workspace: Int, onClose: () -> Unit) {
     var target by remember { mutableIntStateOf(workspace) }
     var hint by remember { mutableStateOf<String?>(null) }
     var keys by remember { mutableStateOf(false) }
+    var slides by remember { mutableStateOf(false) }
+    val zoom = remember { Zoom() }
 
     BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black).testTag("live")) {
         val widthPx = with(density) { maxWidth.roundToPx() }
@@ -95,9 +107,12 @@ fun LiveView(link: DesktopLink, workspace: Int, onClose: () -> Unit) {
             letterSpacing = Type.trackMark, modifier = Modifier.align(Alignment.Center).testTag("live-opening"))
         link.live?.let { info ->
             Box(Modifier.align(Alignment.Center).aspectRatio(info.width.toFloat() / info.height)) {
-                key(info.port, info.width, info.height) { LiveSurface(info) }
+                Box(Modifier.fillMaxSize().clipToBounds().graphicsLayer {
+                    scaleX = zoom.scale; scaleY = zoom.scale
+                    translationX = zoom.offset.x; translationY = zoom.offset.y
+                }) { key(info.port, info.width, info.height) { LiveSurface(link, info) } }
                 Box(Modifier.fillMaxSize().pointerInput(info.width) {
-                    desktopGestures(link, info.width) { step ->
+                    desktopGestures(link, info.width, zoom) { step ->
                         // A desktop on the PC monitor is viewed by mirroring that monitor; the ends do not wrap.
                         val all = link.workspaces
                         val at = all.indexOfFirst { it.id == target }
@@ -115,12 +130,73 @@ fun LiveView(link: DesktopLink, workspace: Int, onClose: () -> Unit) {
             Pill("‹  CLOSE", Modifier.testTag("live-close"), onClose)
         }
         Row(Modifier.align(Alignment.TopEnd).systemBarsPadding().padding(Geo.s3)) {
+            if (zoom.scale > 1.01f) {
+                Pill("1:1", Modifier.testTag("live-unzoom")) { zoom.reset(); link.zoom(1f, 0.5f, 0.5f) }
+                Spacer(Modifier.width(Geo.s2))
+            }
+            Pill(if (slides) "SLIDES ·" else "SLIDES", Modifier.testTag("live-slides")) { slides = !slides }
+            Spacer(Modifier.width(Geo.s2))
             Pill(if (keys) "KEYS ·" else "KEYS", Modifier.testTag("live-keys")) { keys = !keys }
+        }
+        // Floating arrows for presentations: big, half-transparent, at thumb height on each side.
+        if (slides && !keys) {
+            SlideButton("‹", Modifier.align(Alignment.CenterStart).testTag("slide-prev")) { link.pressKey("Left") }
+            SlideButton("›", Modifier.align(Alignment.CenterEnd).testTag("slide-next")) { link.pressKey("Right") }
         }
         hint?.let {
             Box(Modifier.align(Alignment.BottomCenter).systemBarsPadding().padding(Geo.s6)) { Pill(it.uppercase(), Modifier) {} }
         }
         if (keys) KeyboardInput(link, Modifier.align(Alignment.BottomCenter))
+    }
+}
+
+/** The picture's local zoom: [scale] 1..5 about the centre, then [offset] in screen pixels. */
+private class Zoom {
+    var scale by mutableStateOf(1f)
+    var offset by mutableStateOf(Offset.Zero)
+    fun reset() { scale = 1f; offset = Offset.Zero }
+
+    private var sentAt = 0L
+
+    /**
+     * Tells the computer to zoom its own screen the same way, for an audience watching it: the
+     * factor and the point of the unzoomed picture now at the middle of this view. Throttled to
+     * about 30 a second; [force] (the end of a gesture) always goes, so the last value lands.
+     */
+    fun sync(link: DesktopLink, w: Float, h: Float, force: Boolean = false) {
+        val now = System.nanoTime()
+        if (!force && now - sentAt < 33_000_000L) return
+        sentAt = now
+        val centre = unmap(Offset(w / 2, h / 2), w, h)
+        link.zoom(scale, (centre.x / w).coerceIn(0f, 1f), (centre.y / h).coerceIn(0f, 1f))
+    }
+
+    /** Screen point -> point on the unzoomed picture, so a tap lands where the finger is. */
+    fun unmap(p: Offset, w: Float, h: Float): Offset {
+        val c = Offset(w / 2, h / 2)
+        return (p - c - offset) / scale + c
+    }
+
+    /** Scales by [factor] keeping [focus] still, then moves by [pan]; never shows past the edges. */
+    fun apply(factor: Float, focus: Offset, pan: Offset, w: Float, h: Float) {
+        val next = (scale * factor).coerceIn(1f, 5f)
+        val c = Offset(w / 2, h / 2)
+        val f = next / scale
+        var o = (offset - (focus - c)) * f + (focus - c) + pan
+        val mx = w * (next - 1) / 2
+        val my = h * (next - 1) / 2
+        o = Offset(o.x.coerceIn(-mx, mx), o.y.coerceIn(-my, my))
+        scale = next
+        offset = o
+    }
+}
+
+@Composable
+private fun SlideButton(label: String, modifier: Modifier, onClick: () -> Unit) {
+    Box(modifier.systemBarsPadding().padding(Geo.s4).size(72.dp).clip(CircleShape)
+        .background(Color.Black.copy(alpha = 0.45f)).border(Geo.border, T.line, CircleShape)
+        .clickable(onClick = onClick), contentAlignment = Alignment.Center) {
+        Text(label, color = T.ink, fontFamily = Type.display, fontSize = 40.sp)
     }
 }
 
@@ -139,7 +215,7 @@ private fun Pill(label: String, modifier: Modifier, onClick: () -> Unit) {
  * A TextureView is drawn by the window's own renderer, which already shows the rest of the screen.
  */
 @Composable
-private fun LiveSurface(info: LiveInfo) {
+private fun LiveSurface(link: DesktopLink, info: LiveInfo) {
     AndroidView(factory = { context ->
         TextureView(context).apply {
             var stream: VideoStream? = null
@@ -148,7 +224,7 @@ private fun LiveSurface(info: LiveInfo) {
                 override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
                     val s = Surface(texture)
                     surface = s
-                    stream = VideoStream(info.port, info.width, info.height, s).also { it.start() }
+                    stream = VideoStream(link, info.port, info.width, info.height, s).also { it.start() }
                 }
                 override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {}
                 override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
@@ -222,12 +298,12 @@ private fun PointerEvent.centroid(): Offset {
  * Turns touches into pointer commands. [streamWidth] converts finger travel into the desktop's
  * own pixels for scrolling; [onSwipe] gets -1 (previous) or +1 (next) once per two-finger swipe.
  */
-private suspend fun PointerInputScope.desktopGestures(link: DesktopLink, streamWidth: Int, onSwipe: (Int) -> Unit) {
+private suspend fun PointerInputScope.desktopGestures(link: DesktopLink, streamWidth: Int, zoom: Zoom, onSwipe: (Int) -> Unit) {
     val slop = viewConfiguration.touchSlop
     val w = size.width.toFloat()
     val h = size.height.toFloat()
-    fun x(p: Offset) = (p.x / w).coerceIn(0f, 1f)
-    fun y(p: Offset) = (p.y / h).coerceIn(0f, 1f)
+    fun x(p: Offset) = (zoom.unmap(p, w, h).x / w).coerceIn(0f, 1f)
+    fun y(p: Offset) = (zoom.unmap(p, w, h).y / h).coerceIn(0f, 1f)
 
     awaitEachGesture {
         val down = awaitFirstDown(requireUnconsumed = false)
@@ -259,7 +335,7 @@ private suspend fun PointerInputScope.desktopGestures(link: DesktopLink, streamW
                 link.pointer("up", x(at), y(at))
                 drainUntilLifted()
             }
-            FirstMove.SecondFinger -> twoFingers(link, streamWidth, w, slop, onSwipe)
+            FirstMove.SecondFinger -> twoFingers(link, streamWidth, zoom, w, size.height.toFloat(), slop, onSwipe)
         }
     }
 }
@@ -281,24 +357,50 @@ private suspend fun AwaitPointerEventScope.drainUntilLifted() {
     } while (e.fingers() > 0)
 }
 
-/** The axis is decided by the first real movement, then only that gesture can happen. */
+private fun PointerEvent.spread(): Float {
+    val down = changes.filter { it.pressed }
+    return if (down.size < 2) 0f else (down[0].position - down[1].position).getDistance()
+}
+
+/**
+ * The first real movement decides the gesture, then only that one can happen: fingers spreading
+ * or closing zoom (and pan the zoomed picture), a vertical move scrolls, a horizontal one swipes.
+ */
 private suspend fun AwaitPointerEventScope.twoFingers(
-    link: DesktopLink, streamWidth: Int, width: Float, slop: Float, onSwipe: (Int) -> Unit,
+    link: DesktopLink, streamWidth: Int, zoom: Zoom, width: Float, height: Float, slop: Float, onSwipe: (Int) -> Unit,
 ) {
     var start: Offset? = null
     var last = 0f
+    var spread0 = 0f
+    var lastSpread = 0f
+    var lastC = Offset.Zero
+    var pinch = false
     var vertical: Boolean? = null
     var scrolled = false
     var swiped = false
+    var zoomed = false
     do {
         val e = awaitPointerEvent()
         if (e.fingers() == 2) {
             val c = e.centroid()
-            val s = start ?: c.also { start = it; last = it.y }
+            val sp = e.spread()
+            val s = start ?: c.also { start = it; last = it.y; spread0 = sp; lastSpread = sp; lastC = it }
             val dx = c.x - s.x
             val dy = c.y - s.y
-            if (vertical == null && maxOf(abs(dx), abs(dy)) > slop * 1.5f) vertical = abs(dy) >= abs(dx)
-            if (vertical == true) {
+            if (!pinch && vertical == null) {
+                if (abs(sp - spread0) > slop * 2) pinch = true
+                else if (maxOf(abs(dx), abs(dy)) > slop * 1.5f) {
+                    // Already zoomed in, two fingers moving together pan the picture instead.
+                    if (zoom.scale > 1.01f) pinch = true else vertical = abs(dy) >= abs(dx)
+                }
+            }
+            if (pinch) {
+                if (lastSpread > 0f && sp > 0f) {
+                    zoom.apply(sp / lastSpread, c, c - lastC, width, height)
+                    zoom.sync(link, width, height)
+                    zoomed = true
+                }
+            } else if (vertical == true) {
                 // Content follows the finger: moving up scrolls the page down (positive lines).
                 link.scroll(0f, -(c.y - last) * streamWidth / width / 15f)
                 scrolled = true
@@ -307,10 +409,13 @@ private suspend fun AwaitPointerEventScope.twoFingers(
                 onSwipe(if (dx > 0) -1 else 1)
             }
             last = c.y
+            lastSpread = sp
+            lastC = c
         }
         e.changes.forEach { it.consume() }
     } while (e.fingers() > 0)
     if (scrolled) link.scroll(0f, 0f, end = true)
+    if (zoomed) zoom.sync(link, width, height, force = true)
 }
 
 // ---- Video ----
@@ -319,7 +424,7 @@ private suspend fun AwaitPointerEventScope.twoFingers(
  * Reads the computer's H.264 stream (Annex-B, one access unit per AUD NAL) and decodes it
  * straight onto [surface]. Reconnects quietly while the computer is not serving yet.
  */
-class VideoStream(private val port: Int, private val width: Int, private val height: Int, private val surface: Surface) {
+class VideoStream(private val link: DesktopLink, private val port: Int, private val width: Int, private val height: Int, private val surface: Surface) {
     @Volatile private var running = false
     @Volatile private var socket: Socket? = null
     private var thread: Thread? = null
@@ -339,8 +444,7 @@ class VideoStream(private val port: Int, private val width: Int, private val hei
     private fun loop() {
         while (running) {
             try {
-                Socket().use { s ->
-                    s.connect(InetSocketAddress("127.0.0.1", port), 1500)
+                link.dialVideo(port).use { s ->
                     socket = s
                     decode(s.getInputStream())
                 }
