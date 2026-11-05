@@ -164,9 +164,12 @@ private fun LiveSurface(info: LiveInfo) {
 private val extraKeys = listOf("Esc" to "Escape", "Tab" to "Tab", "←" to "Left", "↑" to "Up", "↓" to "Down", "→" to "Right")
 
 /**
- * The soft keyboard types into an invisible field that always holds one zero-width space. Any
- * change is therefore either typed text (sent as is) or the space being deleted (BackSpace),
- * and the field is reset at once, so nothing is ever composed or autocorrected on the phone.
+ * The soft keyboard types into an invisible field that starts with one zero-width space. Each
+ * change is diffed against the field's previous text: characters past the common prefix are
+ * typed, characters removed become BackSpace. The field keeps what the IME last wrote instead
+ * of being reset on every key, because a reset that lands after the IME has already sent its
+ * next character (fast or injected typing) made the IME resend the whole word, so the desktop
+ * got "a", "ab", "abc" instead of "abc". The field is reset only once it is emptied or long.
  */
 @Composable
 private fun KeyboardInput(link: DesktopLink, modifier: Modifier) {
@@ -184,9 +187,11 @@ private fun KeyboardInput(link: DesktopLink, modifier: Modifier) {
         BasicTextField(
             value = field,
             onValueChange = { v ->
-                if (v.text.isEmpty()) link.pressKey("BackSpace")
-                else if (v.text != seed) link.typeText(v.text.replace(seed, ""))
-                field = TextFieldValue(seed, TextRange(seed.length))
+                val common = field.text.commonPrefixWith(v.text).length
+                repeat(field.text.length - common) { link.pressKey("BackSpace") }
+                val typed = v.text.substring(common).replace(seed, "")
+                if (typed.isNotEmpty()) link.typeText(typed)
+                field = if (v.text.isEmpty() || v.text.length > 64) TextFieldValue(seed, TextRange(seed.length)) else v
             },
             // Password keeps predictive text and autocorrect out of the way.
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Send, autoCorrectEnabled = false),

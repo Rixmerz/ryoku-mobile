@@ -767,16 +767,36 @@ async def serve_private(handler, port: int) -> asyncio.Server:
     return server
 
 
+def reverse_targets() -> list[str]:
+    """Serials to tunnel to: ANDROID_SERIAL alone when set (an emulator included), otherwise every
+    attached USB phone. Emulators are skipped unless RYOKU_LINK_EMULATOR=1."""
+    out = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5).stdout
+    serials = [l.split()[0] for l in out.splitlines()[1:] if l.endswith("\tdevice")]
+    wanted = os.environ.get("ANDROID_SERIAL")
+    if wanted:
+        return [s for s in serials if s == wanted]
+    return [s for s in serials if not s.startswith("emulator-") or os.environ.get("RYOKU_LINK_EMULATOR") == "1"]
+
+
+tunnelled: set[str] = set()
+
+
+def clear_reverse() -> None:
+    """Removes the tunnels this run created, so no port keeps pointing at a socket that is gone."""
+    for serial in sorted(tunnelled):
+        for port in (PORT, VIDEO_PORT):
+            subprocess.run([ADB, "-s", serial, "reverse", "--remove", f"tcp:{port}"], capture_output=True, timeout=5)
+    tunnelled.clear()
+
+
 async def keep_reverse() -> None:
-    """Re-creates the USB tunnels whenever a phone (re)appears; `adb reverse` is per connection."""
+    """Re-creates the tunnels whenever a phone (re)appears; `adb reverse` is per connection."""
     while True:
         try:
-            out = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5).stdout
-            for serial in [l.split()[0] for l in out.splitlines()[1:] if l.endswith("\tdevice")]:
-                if serial.startswith("emulator-") and os.environ.get("RYOKU_LINK_EMULATOR") != "1":
-                    continue
+            for serial in reverse_targets():
                 for port in (PORT, VIDEO_PORT):
                     subprocess.run([ADB, "-s", serial, "reverse", f"tcp:{port}", f"localfilesystem:{socket_path(port)}"], capture_output=True, timeout=5)
+                tunnelled.add(serial)
         except (OSError, subprocess.TimeoutExpired) as e:
             log(f"adb unavailable ({e})")
         await asyncio.sleep(5)
@@ -801,7 +821,9 @@ async def main() -> None:
     finally:
         work.cancel()
         waiter.cancel()
+        await asyncio.gather(work, waiter, return_exceptions=True)  # retrieves the cancellation so asyncio does not print it
         await end_view()  # the headless output must not outlive the bridge
+        await asyncio.to_thread(clear_reverse)
 
 
 if __name__ == "__main__":
