@@ -578,15 +578,15 @@ class CastCommand(unittest.TestCase):
             self.assertEqual(sent, [{"type": "cast", "error": "not a package name"}])
 
     def test_a_failed_cast_reports_the_reason_and_is_not_remembered(self):
-        sent, _ = self.run_cast({"cmd": "cast", "package": "com.x.y"}, mock.Mock(side_effect=ryoku_link.CastError("scrcpy is not installed on the computer")))
-        self.assertEqual(sent, [{"type": "cast", "package": "com.x.y", "error": "scrcpy is not installed on the computer"}])
+        sent, _ = self.run_cast({"cmd": "cast", "package": "com.google.android.youtube"}, mock.Mock(side_effect=ryoku_link.CastError("scrcpy is not installed on the computer")))
+        self.assertEqual(sent, [{"type": "cast", "package": "com.google.android.youtube", "error": "scrcpy is not installed on the computer"}])
         self.assertEqual(ryoku_link.casts, {})
 
     def test_a_second_cast_of_the_same_app_is_refused(self):
-        ryoku_link.casts["com.x.y"] = ryoku_link.Cast("com.x.y", 8, "0x1", 3)
-        sent, launched = self.run_cast({"cmd": "cast", "package": "com.x.y"})
+        ryoku_link.casts["com.google.android.youtube"] = ryoku_link.Cast("com.google.android.youtube", 8, "0x1", 3)
+        sent, launched = self.run_cast({"cmd": "cast", "package": "com.google.android.youtube"})
         launched.assert_not_called()
-        self.assertEqual(sent, [{"type": "cast", "package": "com.x.y", "error": "already on the PC, workspace 8"}])
+        self.assertEqual(sent, [{"type": "cast", "package": "com.google.android.youtube", "error": "already on the PC, workspace 8"}])
 
     def test_a_cast_ends_the_live_view_and_resets_the_zoom_before_launching(self):
         class Owner:
@@ -601,16 +601,16 @@ class CastCommand(unittest.TestCase):
         ryoku_link.view = Owner()
         self.addCleanup(setattr, ryoku_link, "view", None)
         with mock.patch.object(ryoku_link, "end_view", end_view):
-            self.run_cast({"cmd": "cast", "package": "com.x.y"}, mock.Mock(return_value=ryoku_link.Cast("com.x.y", 7, "0xabc", 3)))
+            self.run_cast({"cmd": "cast", "package": "com.google.android.youtube"}, mock.Mock(return_value=ryoku_link.Cast("com.google.android.youtube", 7, "0xabc", 3)))
         self.assertEqual(self.order, ["end view", ("zoom", 1.0), "launch"])
 
     def test_a_cast_resets_the_zoom_even_without_a_live_view(self):
-        self.run_cast({"cmd": "cast", "package": "com.x.y"}, mock.Mock(return_value=ryoku_link.Cast("com.x.y", 7, "0xabc", 3)))
+        self.run_cast({"cmd": "cast", "package": "com.google.android.youtube"}, mock.Mock(return_value=ryoku_link.Cast("com.google.android.youtube", 7, "0xabc", 3)))
         self.assertEqual(self.order, [("zoom", 1.0), "launch"])
 
     def test_a_refused_duplicate_leaves_the_live_view_alone(self):
-        ryoku_link.casts["com.x.y"] = ryoku_link.Cast("com.x.y", 8, "0x1", 3)
-        self.run_cast({"cmd": "cast", "package": "com.x.y"})
+        ryoku_link.casts["com.google.android.youtube"] = ryoku_link.Cast("com.google.android.youtube", 8, "0x1", 3)
+        self.run_cast({"cmd": "cast", "package": "com.google.android.youtube"})
         self.assertEqual(self.order, [])
 
     def test_closing_the_window_forgets_the_cast(self):
