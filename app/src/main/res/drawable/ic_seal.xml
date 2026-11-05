@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The house mark: a vermillion sun over a hairline horizon, on the 108dp adaptive canvas. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#E2342A" android:pathData="M54,36a14,14 0,1 1,0 28a14,14 0,1 1,0 -28z" />
+    <path android:fillColor="#CDC4BA" android:pathData="M30,68h48v1.2h-48z" />
+    <path android:fillColor="#E2342A" android:pathData="M44,72h20v1.6h-20zM48,76h12v1.2h-12z" />
+</vector>
