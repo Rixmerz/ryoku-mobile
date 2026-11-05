@@ -119,6 +119,7 @@ class CastService : AccessibilityService() {
     private fun refreshBubble() {
         if (front == null) removeBubble() else if (bubble == null) addBubble()
         if (front == null) unwatchVideo() else watchVideo()
+        refreshPlayButton()
     }
 
     private var watched: MediaController? = null
@@ -190,9 +191,10 @@ class CastService : AccessibilityService() {
 
     private var playButton: View? = null
 
-    /** The play/pause button exists exactly while a PC session runs, under where the PC button sits. */
+    /** The play/pause button exists while a PC session runs and YouTube is in front, under the PC button:
+     *  like the PC button, it must not follow the user into other apps. */
     private fun refreshPlayButton() {
-        if (!PcSession.active) return removePlayButton()
+        if (!PcSession.active || front == null) return removePlayButton()
         if (playButton != null) return
         val t = Tokens(signature)
         val density = resources.displayMetrics.density
