@@ -2,13 +2,16 @@
 """ryoku-link: shows and drives the Ryoku desktop's Hyprland workspaces from the phone, over USB.
 
 The phone app connects to 127.0.0.1:7466 on itself; `adb reverse` tunnels that port over the
-USB cable to this server, which also listens on 127.0.0.1 only, so nothing is exposed to the
-network. The control protocol is newline-delimited JSON, the same for any future transport:
+USB cable to a unix socket in this user's runtime directory (mode 0700, socket 0600), so
+nothing is exposed to the network and no other local user can reach it. That matters since
+the phone's input is injected into the desktop. The control protocol is newline-delimited
+JSON, the same for any future transport:
 
   server -> phone  {"type": "state", "host": "...", "workspaces": [{"id", "name", "active",
                     "busy", "windows": [{"class", "title"}]}], "viewing": <id or null>}
   server -> phone  {"type": "view", "workspace": 3, "width": 1920, "height": 864, "port": 7467}
-                   or {"type": "view", "workspace": 3, "busy": true} when the PC monitor shows it
+                   or {"type": "view", "workspace": 3, "busy": true} when the PC monitor shows it,
+                   or {"type": "view", "workspace": 3, "error": "..."} when it could not be opened
   phone -> server  {"cmd": "workspace", "id": 3}            switch the PC monitor's workspace
   phone -> server  {"cmd": "view", "id": 3, "width": 1080, "height": 2400}
                    {"cmd": "unview"}
@@ -43,6 +46,8 @@ import time
 
 PORT = int(os.environ.get("RYOKU_LINK_PORT", "7466"))
 VIDEO_PORT = int(os.environ.get("RYOKU_LINK_VIDEO_PORT", str(PORT + 1)))
+# PORT and VIDEO_PORT are the phone's side of the tunnel; this side is a unix socket per port.
+SOCKET_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "ryoku-link")
 # The distro adb package is broken on this machine; prefer the SDK's copy when present.
 ADB = os.environ.get("RYOKU_ADB") or (
     os.path.expanduser("~/Android/platform-tools/adb")
@@ -296,9 +301,8 @@ class VirtualPointer:
         self._roundtrip()
         return ptr
 
-    def _send(self, opcode: int, *fields: int, signed: bool = False) -> None:
-        fmt = "<" + ("i" if signed else "I") * len(fields)
-        self.sock.sendall(pack(self._id, opcode, struct.pack(fmt, *fields)))
+    def _send(self, opcode: int, *fields: int) -> None:
+        self.sock.sendall(pack(self._id, opcode, struct.pack("<" + "I" * len(fields), *fields)))
 
     @staticmethod
     def _now() -> int:
@@ -319,7 +323,7 @@ class VirtualPointer:
         self._frame()
 
     def scroll(self, dx: float, dy: float) -> None:
-        """Smooth finger scrolling, in wheel lines (positive dy scrolls content down)."""
+        """Smooth finger scrolling, in wheel lines (positive dy is a wheel turned down: content moves up)."""
         self._send(5, AXIS_SOURCE_FINGER)
         for axis, lines in ((AXIS_HORIZONTAL, dx), (AXIS_VERTICAL, dy)):
             if lines:
@@ -625,7 +629,12 @@ async def start_view(writer: asyncio.StreamWriter, ws: int, width: int, height: 
                 await reply(writer, {"type": "view", "workspace": ws, "busy": True})
                 return
             candidate = PhoneView(writer, width, height)
-            await asyncio.to_thread(candidate.open)
+            try:
+                await asyncio.to_thread(candidate.open)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+                log(f"live view could not open: {e}")
+                await reply(writer, {"type": "view", "workspace": ws, "error": "could not open the view"})
+                return
             candidate.watcher = asyncio.create_task(candidate.rest_watcher())
             view = candidate
             log(f"live view opened: {candidate.width}x{candidate.height}")
@@ -736,6 +745,28 @@ async def watch_hyprland() -> None:
             await asyncio.sleep(3)
 
 
+def socket_path(port: int) -> str:
+    return os.path.join(SOCKET_DIR, f"{port}.sock")
+
+
+async def serve_private(handler, port: int) -> asyncio.Server:
+    """Listens on this user's unix socket for `port`; refuses to take over a live instance's."""
+    os.makedirs(SOCKET_DIR, mode=0o700, exist_ok=True)
+    os.chmod(SOCKET_DIR, 0o700)
+    path = socket_path(port)
+    try:
+        _, probe = await asyncio.open_unix_connection(path)
+    except OSError:
+        pass  # nobody is listening: a missing path or a stale socket left by a crash
+    else:
+        probe.close()
+        await probe.wait_closed()
+        raise SystemExit(f"ryoku-link: already running ({path} answers)")
+    server = await asyncio.start_unix_server(handler, path)
+    os.chmod(path, 0o600)
+    return server
+
+
 async def keep_reverse() -> None:
     """Re-creates the USB tunnels whenever a phone (re)appears; `adb reverse` is per connection."""
     while True:
@@ -745,16 +776,16 @@ async def keep_reverse() -> None:
                 if serial.startswith("emulator-") and os.environ.get("RYOKU_LINK_EMULATOR") != "1":
                     continue
                 for port in (PORT, VIDEO_PORT):
-                    subprocess.run([ADB, "-s", serial, "reverse", f"tcp:{port}", f"tcp:{port}"], capture_output=True, timeout=5)
+                    subprocess.run([ADB, "-s", serial, "reverse", f"tcp:{port}", f"localfilesystem:{socket_path(port)}"], capture_output=True, timeout=5)
         except (OSError, subprocess.TimeoutExpired) as e:
             log(f"adb unavailable ({e})")
         await asyncio.sleep(5)
 
 
 async def main() -> None:
-    server = await asyncio.start_server(handle, "127.0.0.1", PORT)
-    video = await asyncio.start_server(handle_video, "127.0.0.1", VIDEO_PORT)
-    log(f"listening on 127.0.0.1:{PORT} (video {VIDEO_PORT}), adb at {ADB}")
+    server = await serve_private(handle, PORT)
+    video = await serve_private(handle_video, VIDEO_PORT)
+    log(f"listening on {socket_path(PORT)} (video {socket_path(VIDEO_PORT)}), adb at {ADB}")
     if any(m["name"] == OUTPUT for m in hyprctl("monitors") or []):
         log(f"removing stale output {OUTPUT} from a previous run")
         subprocess.run(["hyprctl", "output", "remove", OUTPUT], capture_output=True, timeout=3)

@@ -31,6 +31,8 @@ class DesktopLink(private val port: Int = 7466) {
     var live by mutableStateOf<LiveInfo?>(null); private set
     /** The workspace the computer last refused to show because its monitor is on it. */
     var refused by mutableStateOf<Int?>(null); private set
+    /** True when the computer could not open the last view it was asked for. */
+    var openFailed by mutableStateOf(false); private set
 
     private val io = Executors.newSingleThreadExecutor()
     private val sender = Executors.newSingleThreadExecutor()
@@ -52,8 +54,10 @@ class DesktopLink(private val port: Int = 7466) {
     fun switchTo(id: Int) = send(JSONObject().put("cmd", "workspace").put("id", id))
 
     /** Asks for workspace [id] on the phone's headless output, in the aspect of this screen (the computer picks the exact size). */
-    fun openView(id: Int, width: Int, height: Int) =
+    fun openView(id: Int, width: Int, height: Int) {
+        openFailed = false
         send(JSONObject().put("cmd", "view").put("id", id).put("width", width).put("height", height))
+    }
 
     fun closeView() {
         live = null
@@ -112,7 +116,9 @@ class DesktopLink(private val port: Int = 7466) {
     }
 
     private fun parseView(o: JSONObject) {
-        if (o.optBoolean("busy")) {
+        if (o.has("error")) {
+            openFailed = true
+        } else if (o.optBoolean("busy")) {
             refused = o.optInt("workspace")
         } else if (o.has("port")) {
             live = LiveInfo(o.getInt("workspace"), o.getInt("width"), o.getInt("height"), o.getInt("port"))

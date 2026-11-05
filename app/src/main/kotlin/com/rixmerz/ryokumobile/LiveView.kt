@@ -88,13 +88,17 @@ fun LiveView(link: DesktopLink, workspace: Int, onClose: () -> Unit) {
         }
         LaunchedEffect(link.live?.workspace) { link.live?.workspace?.let { target = it } }
         LaunchedEffect(link.refused) {
-            link.refused?.let { hint = "Desktop $it is on the PC screen" }
+            link.refused?.let {
+                hint = "Desktop $it is on the PC screen"
+                // The swipe optimistically moved `target`; the view stayed where it was.
+                link.live?.let { live -> target = live.workspace }
+            }
             link.clearRefusal()
         }
         LaunchedEffect(hint) { if (hint != null) { delay(1800); hint = null } }
 
         // Opening can take a while: the computer waits out its own display hotplug handling first.
-        if (link.live == null) Text("OPENING DESKTOP…", color = T.inkFaint, fontFamily = Type.mono, fontSize = Type.fSmall,
+        if (link.live == null) Text(if (link.openFailed) "COULD NOT OPEN THE DESKTOP" else "OPENING DESKTOP…", color = T.inkFaint, fontFamily = Type.mono, fontSize = Type.fSmall,
             letterSpacing = Type.trackMark, modifier = Modifier.align(Alignment.Center).testTag("live-opening"))
         link.live?.let { info ->
             Box(Modifier.align(Alignment.Center).aspectRatio(info.width.toFloat() / info.height)) {
@@ -166,7 +170,7 @@ private val extraKeys = listOf("Esc" to "Escape", "Tab" to "Tab", "←" to "Left
  */
 @Composable
 private fun KeyboardInput(link: DesktopLink, modifier: Modifier) {
-    val seed = "​"
+    val seed = "\u200b"
     var field by remember { mutableStateOf(TextFieldValue(seed, TextRange(seed.length))) }
     val focus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current

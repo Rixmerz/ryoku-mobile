@@ -1,6 +1,10 @@
 """Run with: python3 -m unittest discover -s pc"""
 
+import asyncio
+import os
+import stat
 import struct
+import tempfile
 import unittest
 from unittest import mock
 
@@ -117,6 +121,30 @@ class Input(unittest.TestCase):
     def test_unknown_key_names_never_reach_wtype(self):
         self.assertIsNone(self.wtype_argv({"key": "rm -rf"}))
         self.assertIsNone(self.wtype_argv({"key": "-M"}))
+
+
+class PrivateSocket(unittest.TestCase):
+    def test_socket_is_owner_only_and_a_second_instance_is_refused(self):
+        async def scenario(directory):
+            async def noop(reader, writer):
+                writer.close()
+                await writer.wait_closed()
+
+            first = await ryoku_link.serve_private(noop, 4242)
+            try:
+                path = ryoku_link.socket_path(4242)
+                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700)
+                with self.assertRaises(SystemExit):
+                    await ryoku_link.serve_private(noop, 4242)
+            finally:
+                first.close()
+                await first.wait_closed()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = os.path.join(tmp, "ryoku-link")
+            with mock.patch.object(ryoku_link, "SOCKET_DIR", directory):
+                asyncio.run(scenario(directory))
 
 
 if __name__ == "__main__":
