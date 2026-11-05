@@ -13,7 +13,6 @@ import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.TextView
-import android.widget.Toast
 import androidx.compose.ui.graphics.toArgb
 import kotlin.concurrent.thread
 
@@ -33,6 +32,7 @@ class CastService : AccessibilityService() {
     private var bubble: View? = null
     private var params: WindowManager.LayoutParams? = null
     @Volatile private var sending = false
+    private var notice: View? = null
 
     // ponytail: the position is kept for this run only; persist it if people move the button a lot.
     private var savedX = -1
@@ -58,6 +58,7 @@ class CastService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         removeBubble()
+        removeNotice()
         return super.onUnbind(intent)
     }
 
@@ -141,6 +142,8 @@ class CastService : AccessibilityService() {
             try {
                 link.start(applicationContext)
                 if (!waitFor(8_000) { link.connected }) return@thread say("No computer found: plug the cable in")
+                // A bridge from before casting never answers `cast`; say so now instead of after 35 s of silence.
+                if (!link.castable) return@thread say("The PC bridge is out of date: restart ryoku-link on the computer")
                 link.cast(pkg)
                 // The computer waits up to ~25 s for scrcpy to open its window.
                 if (!waitFor(35_000) { link.castReply != null }) return@thread say("The computer did not answer")
@@ -162,7 +165,47 @@ class CastService : AccessibilityService() {
         return true
     }
 
-    private fun say(text: String) {
-        ui.post { Toast.makeText(applicationContext, text, Toast.LENGTH_LONG).show() }
+    /**
+     * A line over every app for a few seconds. A Toast is not used: Android drops the toasts of an app
+     * whose notifications are switched off (logcat: "Suppressing toast ... by user request"), and the
+     * button then looks like it does nothing. An accessibility overlay needs no permission.
+     */
+    private fun say(text: String) { ui.post {
+        removeNotice()
+        val t = Tokens(signature)
+        val density = resources.displayMetrics.density
+        val view = TextView(this).apply {
+            this.text = text
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(t.ink.toArgb())
+            setPadding((16 * density).toInt(), (10 * density).toInt(), (16 * density).toInt(), (10 * density).toInt())
+            background = GradientDrawable().apply {
+                cornerRadius = 12 * density
+                setColor(t.paper.toArgb())
+                setStroke((1 * density).toInt().coerceAtLeast(1), t.ink.toArgb())
+            }
+        }
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            y = (96 * density).toInt()
+        }
+        runCatching { getSystemService(WindowManager::class.java).addView(view, lp) }.onSuccess {
+            notice = view
+            ui.postDelayed({ if (notice === view) removeNotice() }, NOTICE_MS)
+        }
+    } }
+
+    private fun removeNotice() {
+        val view = notice ?: return
+        runCatching { getSystemService(WindowManager::class.java).removeView(view) }
+        notice = null
     }
+
+    private companion object { const val NOTICE_MS = 5_000L }
 }

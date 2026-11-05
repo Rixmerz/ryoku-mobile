@@ -37,9 +37,10 @@ H.264 Annex-B stream of whichever output the phone looks at (wf-recorder, one ac
 NAL). The phone's input goes to a virtual pointer bound to that same output, so a workspace never
 disappears from the PC because the phone looks at it.
 Casting. `cast` moves a running phone app onto an Android virtual display that scrcpy mirrors in a window
-on the first PC workspace nothing uses, placed there without switching the PC monitor or taking its focus.
-The app keeps its state (`am display move-stack` moves the existing task; launching it on the display
-would start a second task instead). Closing the window ends the cast. Needs scrcpy and adb on the PC.
+on the first PC workspace nothing uses; once the app is there, the PC monitor switches to that workspace
+and focuses the window, and closing the window sends it back to the workspace it was on. A cast first ends
+any live view and resets the screen zoom. The app keeps its state (`am display move-stack` moves the
+existing task; launching it on the display would start a second task instead). Needs scrcpy and adb on the PC.
 Requires Hyprland configured through its Lua API (`hl.dsp`, `hl.monitor`), wf-recorder and wtype.
 """
 
@@ -191,6 +192,9 @@ def snapshot() -> dict:
             )
     return {
         "type": "state",
+        # What this bridge understands beyond the base protocol: a phone that wants one it lacks says so
+        # instead of waiting for an answer an older bridge never gives.
+        "features": ["cast"],
         "host": socket.gethostname(),
         "viewing": viewing,
         "workspaces": [
@@ -473,7 +477,9 @@ class PhoneView:
         log("ryoku-monitor autoscale still running after 25 s; sizing the output anyway")
 
     def close(self) -> None:
-        self.reset_zoom()
+        # Unconditional: a zoom this view lost track of (a failed reset, an earlier run) must not outlive it.
+        self.zoomed_ws = None
+        set_zoom(1.0)
         if self.pointer:
             self.pointer.close()
             self.pointer = None
@@ -835,8 +841,13 @@ async def end_view() -> None:
 # (Android 13+); it stays off the phone's speaker, and apps that opt out of capture stay silent.
 # Closing the window ends the virtual display; --no-vd-destroy-content, when this scrcpy has it, makes
 # Android move the app back to the phone instead of closing it.
+#
+# The display is 1920x1080 at the phone's own density. At scrcpy's old 240 dpi it is 1280 dp wide, so
+# YouTube drew its tablet layout (a player pane beside a comments pane that spun forever); at the
+# phone's 400 dpi the smallest width stays phone-sized and the player fills the window like a phone
+# turned sideways.
 
-CAST_DISPLAY = "1920x1080/240"
+CAST_SIZE = "1920x1080"
 CAST_SETUP_TIMEOUT = 25.0
 # What an installed Android package name looks like: dotted identifiers, never a shell string.
 PACKAGE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+")
@@ -849,8 +860,9 @@ class CastError(Exception):
 
 
 class Cast:
-    def __init__(self, package: str, workspace: int, address: str, display: int):
+    def __init__(self, package: str, workspace: int, address: str, display: int, previous: int | None = None):
         self.package, self.workspace, self.address, self.display = package, workspace, address, display
+        self.previous = previous  # the workspace the PC monitor showed before the cast; None: unknown
 
 
 def valid_package(value) -> bool:
@@ -896,16 +908,53 @@ def cast_title(package: str) -> str:
     return f"ryoku-cast {package}"
 
 
-def scrcpy_argv(scrcpy: str, serial: str, title: str, keep_apps: bool) -> list[str]:
-    argv = [scrcpy, "-s", serial, f"--new-display={CAST_DISPLAY}", "--audio-source=playback", f"--window-title={title}"]
+def phone_density(wm_density: str) -> int | None:
+    """The density the phone really uses, from `wm density`: an override wins over the physical one."""
+    found = dict(re.findall(r"(Physical|Override) density: (\d+)", wm_density))
+    value = found.get("Override") or found.get("Physical")
+    return int(value) if value else None
+
+
+def cast_display(density: int | None) -> str:
+    return f"{CAST_SIZE}/{density}" if density else CAST_SIZE  # no density: scrcpy picks one for the size
+
+
+def scrcpy_argv(scrcpy: str, serial: str, title: str, keep_apps: bool, display: str = CAST_SIZE) -> list[str]:
+    argv = [scrcpy, "-s", serial, f"--new-display={display}", "--audio-source=playback", f"--window-title={title}"]
     return argv + [KEEP_APPS_FLAG] if keep_apps else argv
 
 
 def exec_in_workspace(argv: list[str], workspace: int, log_path: str) -> str:
-    """Lua dispatcher that runs `argv` on `workspace` without switching to it or taking focus.
-    Hyprland runs the command through a shell, so every word is quoted; its output goes to a log."""
+    """Lua dispatcher that runs `argv` on `workspace` without switching to it: the window only
+    becomes the PC's focus once the app is on it (see show_cast). Hyprland runs the command through
+    a shell, so every word is quoted; its output goes to a log."""
     command = f"env ADB={shlex.quote(ADB)} {shlex.join(argv)} >{shlex.quote(log_path)} 2>&1"
     return f"hl.dsp.exec_cmd({json.dumps(command, ensure_ascii=False)}, {{ workspace = \"{int(workspace)} silent\" }})"
+
+
+def focus_window(address: str) -> str:
+    return f"hl.dsp.focus({{ window = {json.dumps('address:' + address)} }})"
+
+
+def pc_workspace(monitors: list[dict]) -> int | None:
+    """The workspace the focused PC monitor shows (the phone's headless output is not a PC monitor)."""
+    pc = [m for m in monitors if m["name"] != OUTPUT]
+    focused = next((m for m in pc if m.get("focused")), pc[0] if pc else None)
+    return focused["activeWorkspace"]["id"] if focused else None
+
+
+def show_cast(cast: Cast) -> list[str]:
+    """Dispatchers that put the PC on the cast's workspace with its window focused."""
+    return [focus_workspace(cast.workspace), focus_window(cast.address)]
+
+
+def return_steps(cast: Cast, monitors: list[dict]) -> list[str]:
+    """Dispatchers that send the PC back to where it was before `cast`. None when the PC has moved on
+    by itself (no monitor shows the cast's now empty workspace any more): it is not pulled back."""
+    shown_on = next((m["name"] for m in monitors if m["activeWorkspace"]["id"] == cast.workspace), None)
+    if cast.previous is None or shown_on is None:
+        return []
+    return [focus_monitor(shown_on), focus_workspace(cast.previous)]
 
 
 def adb(serial: str, *args: str, timeout: float = 8) -> str:
@@ -947,10 +996,13 @@ def launch_cast(package: str) -> Cast:
     if root is None:
         raise CastError("that app is not running on the phone")
     before = parse_displays(adb(serial, "shell", "dumpsys", "display"))
-    workspace = free_workspace(hyprctl("workspaces") or [], hyprctl("monitors") or [])
+    pc_monitors = hyprctl("monitors") or []
+    previous = pc_workspace(pc_monitors)
+    workspace = free_workspace(hyprctl("workspaces") or [], pc_monitors)
     title = cast_title(package)
     log_path = os.path.join(SOCKET_DIR, f"cast-{package}.log")
-    argv = scrcpy_argv(SCRCPY, serial, title, KEEP_APPS_FLAG in help_text)
+    display_spec = cast_display(phone_density(adb(serial, "shell", "wm", "density")))
+    argv = scrcpy_argv(SCRCPY, serial, title, KEEP_APPS_FLAG in help_text, display_spec)
     if KEEP_APPS_FLAG not in help_text:
         log(f"this scrcpy lacks {KEEP_APPS_FLAG}: closing the window will close {package} instead of returning it to the phone")
     if not dispatch(exec_in_workspace(argv, workspace, log_path)):
@@ -975,7 +1027,10 @@ def launch_cast(package: str) -> Cast:
         if (w := window_titled(title)) and w.get("pid"):
             os.kill(w["pid"], signal.SIGTERM)  # tears the virtual display down with it
         raise
-    return Cast(package, window["workspace"]["id"], window["address"], display)
+    cast = Cast(package, window["workspace"]["id"], window["address"], display, previous)
+    if not dispatch(*show_cast(cast)):
+        log(f"cast {package}: could not switch the PC to workspace {cast.workspace}")
+    return cast
 
 
 casts: dict[str, Cast] = {}
@@ -987,6 +1042,11 @@ async def start_cast(writer: asyncio.StreamWriter, package: str) -> None:
         if package in casts:
             await reply(writer, {"type": "cast", "package": package, "error": f"already on the PC, workspace {casts[package].workspace}"})
             return
+        # The phone is leaving for the app: a live view (its headless output, a pulled workspace, a
+        # screen zoom) must not be left on the PC next to the cast, nor shift which workspace is free.
+        if view is not None:
+            await end_view()
+        await asyncio.to_thread(set_zoom, 1.0)
         try:
             cast = await asyncio.to_thread(launch_cast, package)
         except (CastError, OSError, subprocess.SubprocessError) as e:
@@ -1003,10 +1063,16 @@ async def reap_casts() -> None:
     if not casts:
         return
     open_windows = {c["address"] for c in await asyncio.to_thread(hyprctl, "clients") or []}
-    for package, cast in list(casts.items()):
-        if cast.address not in open_windows:
-            del casts[package]
-            log(f"cast {package} ended")
+    ended = [cast for cast in casts.values() if cast.address not in open_windows]
+    for cast in ended:
+        del casts[cast.package]
+        log(f"cast {cast.package} ended")
+    if ended:
+        monitors = await asyncio.to_thread(hyprctl, "monitors") or []
+        for cast in ended:
+            if steps := return_steps(cast, monitors):
+                await asyncio.to_thread(dispatch, *steps)
+                break  # one trip back: the PC cannot return to two places
 
 
 async def handle_video(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -1165,6 +1231,7 @@ async def main() -> None:
     if any(m["name"] == OUTPUT for m in hyprctl("monitors") or []):
         log(f"removing stale output {OUTPUT} from a previous run")
         subprocess.run(["hyprctl", "output", "remove", OUTPUT], capture_output=True, timeout=3)
+    set_zoom(1.0)  # a zoom left by a run that died while the phone was pinching
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, stop.set)

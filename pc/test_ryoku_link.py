@@ -250,6 +250,14 @@ class Zoom(unittest.TestCase):
             self.view.close()
         self.assertEqual(self.set_zoom.call_args_list[-1], mock.call(1.0))
 
+    def test_closing_the_view_resets_the_zoom_even_when_it_was_never_tracked(self):
+        # A zoom left by an earlier run, or by a failed reset, is not in zoomed_ws: close still clears it.
+        self.assertIsNone(self.view.zoomed_ws)
+        with mock.patch.object(ryoku_link, "dispatch"), mock.patch.object(ryoku_link, "hyprctl", return_value=[]), \
+                mock.patch.object(ryoku_link.subprocess, "run"):
+            self.view.close()
+        self.set_zoom.assert_called_once_with(1.0)
+
     def test_changing_workspace_resets_the_zoom(self):
         self.view.zoom_event({"factor": 3, "x": 0.5, "y": 0.5})
         self.view.ws = 4
@@ -257,6 +265,15 @@ class Zoom(unittest.TestCase):
                 mock.patch.object(ryoku_link, "dispatch", return_value=True), mock.patch.object(ryoku_link, "VirtualPointer"):
             self.view.apply()
         self.assertEqual(self.set_zoom.call_args_list[-1], mock.call(1.0))
+
+
+class Capabilities(unittest.TestCase):
+    def test_the_state_tells_the_phone_this_bridge_can_cast(self):
+        def hypr(*args):
+            return {"monitors": monitors(1), "workspaces": [], "clients": []}[args[0]]
+
+        with mock.patch.object(ryoku_link, "hyprctl", hypr), mock.patch.object(ryoku_link, "view", None):
+            self.assertIn("cast", ryoku_link.snapshot()["features"])
 
 
 class PrivateSocket(unittest.TestCase):
@@ -448,12 +465,21 @@ class CastPhoneState(unittest.TestCase):
 
 class CastArgv(unittest.TestCase):
     def test_scrcpy_gets_a_new_display_but_never_starts_the_app(self):
-        argv = ryoku_link.scrcpy_argv("/usr/bin/scrcpy", "324751914997", "ryoku-cast com.x.y", keep_apps=True)
-        self.assertEqual(argv[:4], ["/usr/bin/scrcpy", "-s", "324751914997", "--new-display=1920x1080/240"])
+        argv = ryoku_link.scrcpy_argv("/usr/bin/scrcpy", "324751914997", "ryoku-cast com.x.y", keep_apps=True, display="1920x1080/400")
+        self.assertEqual(argv[:4], ["/usr/bin/scrcpy", "-s", "324751914997", "--new-display=1920x1080/400"])
         self.assertIn("--window-title=ryoku-cast com.x.y", argv)
         self.assertIn("--audio-source=playback", argv)
         self.assertIn("--no-vd-destroy-content", argv)
         self.assertFalse([a for a in argv if a.startswith("--start-app")])  # that would start a second task
+
+    def test_the_display_uses_the_phones_own_density_not_a_tablet_one(self):
+        # 240 dpi made the display 1280 dp wide and YouTube drew a tablet layout with a spinner that never ended.
+        self.assertEqual(ryoku_link.phone_density("Physical density: 400\n"), 400)
+        self.assertEqual(ryoku_link.phone_density("Physical density: 420\nOverride density: 320\n"), 320)
+        self.assertIsNone(ryoku_link.phone_density(""))
+        self.assertEqual(ryoku_link.cast_display(400), "1920x1080/400")
+        self.assertEqual(ryoku_link.cast_display(None), "1920x1080")
+        self.assertNotIn("/240", " ".join(ryoku_link.scrcpy_argv("scrcpy", "S", "t", True)))
 
     def test_the_keep_flag_is_left_out_when_this_scrcpy_has_none(self):
         self.assertNotIn("--no-vd-destroy-content", ryoku_link.scrcpy_argv("scrcpy", "S", "t", keep_apps=False))
@@ -467,6 +493,10 @@ class CastArgv(unittest.TestCase):
         self.assertEqual(words[words.index("/opt/my scrcpy/scrcpy"):][:2], ["/opt/my scrcpy/scrcpy", "-s"])
         self.assertIn("--window-title=ryoku-cast com.x.y", words)
         self.assertTrue(command.endswith(">/run/user/1/ryoku-link/cast-com.x.y.log 2>&1"))
+
+
+def lua_focuses_a_workspace_then_the_window(steps):
+    return steps[0].startswith("hl.dsp.focus({ workspace =") and steps[1].startswith('hl.dsp.focus({ window = "address:')
 
 
 class FakeCastWriter:
@@ -485,13 +515,20 @@ class CastCommand(unittest.TestCase):
 
     def setUp(self):
         self.addCleanup(ryoku_link.casts.clear)
-        patcher = mock.patch.object(ryoku_link, "log")
-        patcher.start()
+        self.order = []  # what happened, in order, across the stubs below
+        for name in ("log",):
+            patcher = mock.patch.object(ryoku_link, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(ryoku_link, "set_zoom", side_effect=lambda f: self.order.append(("zoom", f)) or True)
+        self.set_zoom = patcher.start()
         self.addCleanup(patcher.stop)
 
     def run_cast(self, message, launch=None):
         writer = FakeCastWriter()
-        with mock.patch.object(ryoku_link, "launch_cast", launch or mock.Mock()) as launched:
+        launch = launch or mock.Mock()
+        launched = mock.Mock(side_effect=lambda *a: self.order.append("launch") or launch(*a))
+        with mock.patch.object(ryoku_link, "launch_cast", launched):
             asyncio.run(ryoku_link.on_command(writer, message))
         return writer.sent, launched
 
@@ -519,12 +556,58 @@ class CastCommand(unittest.TestCase):
         launched.assert_not_called()
         self.assertEqual(sent, [{"type": "cast", "package": "com.x.y", "error": "already on the PC, workspace 8"}])
 
+    def test_a_cast_ends_the_live_view_and_resets_the_zoom_before_launching(self):
+        class Owner:
+            pass
+        ended = []
+
+        async def end_view():
+            ended.append(True)
+            self.order.append("end view")
+            ryoku_link.view = None
+
+        ryoku_link.view = Owner()
+        self.addCleanup(setattr, ryoku_link, "view", None)
+        with mock.patch.object(ryoku_link, "end_view", end_view):
+            self.run_cast({"cmd": "cast", "package": "com.x.y"}, mock.Mock(return_value=ryoku_link.Cast("com.x.y", 7, "0xabc", 3)))
+        self.assertEqual(self.order, ["end view", ("zoom", 1.0), "launch"])
+
+    def test_a_cast_resets_the_zoom_even_without_a_live_view(self):
+        self.run_cast({"cmd": "cast", "package": "com.x.y"}, mock.Mock(return_value=ryoku_link.Cast("com.x.y", 7, "0xabc", 3)))
+        self.assertEqual(self.order, [("zoom", 1.0), "launch"])
+
+    def test_a_refused_duplicate_leaves_the_live_view_alone(self):
+        ryoku_link.casts["com.x.y"] = ryoku_link.Cast("com.x.y", 8, "0x1", 3)
+        self.run_cast({"cmd": "cast", "package": "com.x.y"})
+        self.assertEqual(self.order, [])
+
     def test_closing_the_window_forgets_the_cast(self):
         ryoku_link.casts["com.x.y"] = ryoku_link.Cast("com.x.y", 8, "0x1", 3)
         ryoku_link.casts["com.a.b"] = ryoku_link.Cast("com.a.b", 9, "0x2", 4)
-        with mock.patch.object(ryoku_link, "hyprctl", return_value=[{"address": "0x2"}]):
+        with mock.patch.object(ryoku_link, "hyprctl", lambda *a: {"clients": [{"address": "0x2"}], "monitors": monitors(2)}[a[0]]):
             asyncio.run(ryoku_link.reap_casts())
         self.assertEqual(list(ryoku_link.casts), ["com.a.b"])
+
+    def reap_with(self, cast, shown_workspace):
+        ryoku_link.casts[cast.package] = cast
+        dispatched = []
+
+        def hypr(*args):
+            return {"clients": [], "monitors": monitors(shown_workspace)}[args[0]]
+
+        with mock.patch.object(ryoku_link, "hyprctl", hypr), mock.patch.object(ryoku_link, "dispatch", lambda *lua: dispatched.append(lua) or True):
+            asyncio.run(ryoku_link.reap_casts())
+        return dispatched
+
+    def test_closing_the_window_returns_the_pc_to_the_workspace_it_was_on(self):
+        dispatched = self.reap_with(ryoku_link.Cast("com.x.y", 8, "0x1", 3, previous=4), shown_workspace=8)
+        self.assertEqual(dispatched, [(ryoku_link.focus_monitor("eDP-1"), ryoku_link.focus_workspace(4))])
+
+    def test_a_pc_that_moved_on_by_itself_is_not_pulled_back(self):
+        self.assertEqual(self.reap_with(ryoku_link.Cast("com.x.y", 8, "0x1", 3, previous=4), shown_workspace=2), [])
+
+    def test_a_cast_with_no_known_previous_workspace_returns_nowhere(self):
+        self.assertEqual(self.reap_with(ryoku_link.Cast("com.x.y", 8, "0x1", 3), shown_workspace=8), [])
 
 
 class FakeScrcpy(unittest.TestCase):
@@ -550,6 +633,8 @@ class FakeScrcpy(unittest.TestCase):
                 return next(stacks)
             if args[:3] == ("shell", "dumpsys", "display"):
                 return next(displays, DISPLAYS_AFTER)
+            if args[:3] == ("shell", "wm", "density"):
+                return "Physical density: 400\n"
             return ""
 
         def hypr(*args):
@@ -573,10 +658,19 @@ class FakeScrcpy(unittest.TestCase):
             cast, calls, dispatched = self.scenario(tmp)
         self.assertEqual((cast.display, cast.address), (3, "0xfeed"))
         self.assertIn(("shell", "am", "display", "move-stack", "1827", "3"), calls)
-        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(len(dispatched), 2)
         self.assertIn('workspace = "6 silent" }', dispatched[0][0])  # 1-5 hold windows, 5 is on the monitor
-        self.assertIn("--new-display=1920x1080/240", dispatched[0][0])
+        self.assertIn("--new-display=1920x1080/400", dispatched[0][0])  # the phone's own density
         self.assertIn("-s 324751914997", dispatched[0][0])  # the USB phone, not the TCP one
+
+    def test_once_the_app_is_on_the_window_the_pc_switches_to_it_and_remembers_where_it_was(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cast, calls, dispatched = self.scenario(tmp)
+        self.assertEqual(dispatched[1], (ryoku_link.focus_workspace(6), ryoku_link.focus_window("0xfeed")))
+        self.assertEqual((cast.workspace, cast.previous), (6, 5))  # the monitor showed 5 before
+        # The window is shown only after the app was moved onto the display, never while scrcpy was still starting.
+        self.assertIn(("shell", "am", "display", "move-stack", "1827", "3"), calls)
+        self.assertTrue(lua_focuses_a_workspace_then_the_window(dispatched[1]))
 
     def test_the_phone_is_asked_about_nothing_but_a_validated_name_and_integers(self):
         with tempfile.TemporaryDirectory() as tmp:

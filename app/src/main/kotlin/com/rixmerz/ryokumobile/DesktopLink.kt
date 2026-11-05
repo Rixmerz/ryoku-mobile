@@ -53,6 +53,8 @@ class DesktopLink(private val port: Int = 7466) {
     var openFailed by mutableStateOf(false); private set
     /** The computer's last answer to [cast]: the PC workspace it opened on, or why it could not. */
     var castReply by mutableStateOf<CastReply?>(null); private set
+    /** False while connected to a bridge that predates `cast` (it would never answer one); set before [connected]. */
+    var castable by mutableStateOf(false); private set
 
     private val io = Executors.newSingleThreadExecutor()
     private val sender = Executors.newSingleThreadExecutor()
@@ -241,6 +243,7 @@ class DesktopLink(private val port: Int = 7466) {
                 List(wins?.length() ?: 0) { j -> wins!!.getJSONObject(j).let { DesktopWindow(it.optString("class"), it.optString("title")) } })
         }
         host = o.optString("host")
+        castable = o.optJSONArray("features")?.let { f -> (0 until f.length()).any { f.optString(it) == "cast" } } ?: false
         connected = true
     }
 }
