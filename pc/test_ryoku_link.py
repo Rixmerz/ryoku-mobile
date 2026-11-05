@@ -274,6 +274,7 @@ class Capabilities(unittest.TestCase):
 
         with mock.patch.object(ryoku_link, "hyprctl", hypr), mock.patch.object(ryoku_link, "view", None):
             self.assertIn("open_url", ryoku_link.snapshot()["features"])
+            self.assertIn("open_video", ryoku_link.snapshot()["features"])
             self.assertNotIn("cast", ryoku_link.snapshot()["features"])
 
 
@@ -766,6 +767,179 @@ class PlayerWindow(unittest.TestCase):
         for bad in ("https://evil.com/watch?v=" + VIDEO + "&t=1s", self.URL + ";id", self.URL.replace("77s", "x"), "-k Return"):
             with self.assertRaises(ValueError):
                 ryoku_link.navigate_argv(bad)
+
+
+class FindingTheVideo(unittest.TestCase):
+    """The phone reports title, channel, length and position; the bridge picks the video from a search."""
+
+    RICK = {"id": "dQw4w9WgXcQ", "title": "Rick Astley - Never Gonna Give You Up (Official Video)", "channel": "Rick Astley", "duration": 214}
+
+    def result(self, **over):
+        return {**self.RICK, **over}
+
+    def pick(self, candidates, title=None, channel="Rick Astley", duration=214):
+        return ryoku_link.pick_video(candidates, title or self.RICK["title"], channel, duration)
+
+    def test_the_result_with_the_same_title_channel_and_length_wins(self):
+        decoy = self.result(id="AAAAAAAAAAA", channel="Super Top Songs")
+        self.assertEqual(self.pick([decoy, self.result()]), "dQw4w9WgXcQ")
+
+    def test_a_cover_with_the_same_title_but_another_length_is_not_the_video(self):
+        self.assertIsNone(self.pick([self.result(duration=240)]))
+        self.assertEqual(self.pick([self.result(duration=215)]), "dQw4w9WgXcQ")  # within the slack
+
+    def test_another_channel_is_not_the_video(self):
+        self.assertIsNone(self.pick([self.result(channel="Super Top Songs")]))
+
+    def test_punctuation_case_and_a_topic_suffix_do_not_matter(self):
+        found = self.result(title="rick astley – never gonna give you up (official video)", channel="Rick Astley - Topic")
+        self.assertEqual(self.pick([found]), "dQw4w9WgXcQ")
+
+    def test_a_different_title_is_not_the_video(self):
+        self.assertIsNone(self.pick([self.result(title="Never Gonna Give You Up (Lyrics)")]))
+
+    def test_the_exact_title_beats_a_similar_one_that_came_first(self):
+        similar = self.result(id="BBBBBBBBBBB", title=self.RICK["title"] + " 4K")
+        self.assertEqual(self.pick([similar, self.result()]), "dQw4w9WgXcQ")
+
+    def test_without_a_channel_only_an_exact_title_matches(self):
+        self.assertEqual(self.pick([self.result()], channel=None), "dQw4w9WgXcQ")
+        self.assertIsNone(self.pick([self.result(title=self.RICK["title"] + " 4K")], channel=None))
+
+    def test_a_result_without_a_plain_video_id_or_length_is_never_picked(self):
+        self.assertIsNone(self.pick([self.result(id="$(id)"), self.result(id="short"), self.result(duration=None)]))
+
+    def test_the_same_video_is_searched_once(self):
+        ryoku_link.resolved_videos.clear()
+        search = mock.Mock(return_value=[self.result()])
+        for title in (self.RICK["title"], self.RICK["title"].upper()):
+            self.assertEqual(ryoku_link.resolve_video(title, "Rick Astley", 214, search), "dQw4w9WgXcQ")
+        self.assertEqual(search.call_count, 1)
+
+    def test_a_video_nobody_matched_is_not_cached_and_is_refused(self):
+        ryoku_link.resolved_videos.clear()
+        search = mock.Mock(return_value=[])
+        for _ in range(2):
+            with self.assertRaises(ryoku_link.HandoffError):
+                ryoku_link.resolve_video("x", "y", 100, search)
+        self.assertEqual((search.call_count, ryoku_link.resolved_videos), (2, {}))
+
+    def test_the_cache_forgets_its_oldest_entry_when_full(self):
+        ryoku_link.resolved_videos.clear()
+        with mock.patch.object(ryoku_link, "CACHE_SIZE", 2):
+            for n in range(3):
+                ryoku_link.resolve_video(f"t{n}", "c", 100, lambda q, n=n: [{"id": f"{n}" * 11, "title": f"t{n}", "channel": "c", "duration": 100}])
+        self.assertEqual(list(ryoku_link.resolved_videos.values()), ["1" * 11, "2" * 11])
+
+    def test_the_search_asks_yt_dlp_with_an_argument_list_and_the_query_after_the_prefix(self):
+        out = json.dumps(self.RICK) + "\nnot json\n"
+        with mock.patch.object(ryoku_link.shutil, "which", lambda name: "/usr/bin/yt-dlp"), \
+                mock.patch.object(ryoku_link.subprocess, "run", mock.Mock(return_value=mock.Mock(stdout=out, returncode=0))) as run:
+            self.assertEqual(ryoku_link.search_youtube("--exec id; $(id)"), [self.RICK])
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[-1], "ytsearch5:--exec id; $(id)")
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_a_missing_yt_dlp_is_said_plainly(self):
+        with mock.patch.object(ryoku_link.shutil, "which", lambda name: None), self.assertRaisesRegex(ryoku_link.HandoffError, "yt-dlp is not installed"):
+            ryoku_link.search_youtube("x")
+
+
+class PlaybackPosition(unittest.TestCase):
+    def seconds(self, **msg):
+        return ryoku_link.playback_seconds({"position_ms": 60_000, **msg}, 600)
+
+    def test_a_paused_session_reports_its_position_as_it_is(self):
+        self.assertEqual(self.seconds(playing=False, age_ms=999_000), 60)
+
+    def test_a_playing_session_moves_on_by_the_time_since_its_report_times_the_speed(self):
+        self.assertEqual(self.seconds(playing=True, age_ms=30_000, speed=1.0), 90)
+        self.assertEqual(self.seconds(playing=True, age_ms=30_000, speed=2.0), 120)
+        self.assertEqual(self.seconds(playing=True, age_ms=1_999, speed=1.0), 61)  # whole seconds, rounded down
+
+    def test_it_never_runs_past_the_video(self):
+        self.assertEqual(self.seconds(playing=True, age_ms=900_000, speed=1.0), 600)
+
+    def test_a_missing_or_hostile_position_is_unknown_not_zero(self):
+        for msg in ({}, {"position_ms": None}, {"position_ms": -1}, {"position_ms": "9; id"}, {"position_ms": True}):
+            self.assertIsNone(ryoku_link.playback_seconds(msg, 600), msg)
+        for msg in ({"age_ms": -5}, {"speed": 0}, {"speed": "fast"}, {"speed": True}):
+            self.assertIsNone(ryoku_link.playback_seconds({"position_ms": 1000, "playing": True, **msg}, 600), msg)
+
+
+class OpenVideoCommand(unittest.TestCase):
+    ROW = {"id": VIDEO, "title": "Some Song", "channel": "Some Band", "duration": 200}
+    MSG = {"cmd": "open_video", "title": "Some Song", "channel": "Some Band", "duration_ms": 200_000,
+           "position_ms": 10_000, "age_ms": 5_000, "speed": 1.0, "playing": True}
+
+    def send(self, msg, rows):
+        sent, opened = [], []
+        ryoku_link.resolved_videos.clear()
+
+        async def fake_reply(writer, message):
+            sent.append(message)
+
+        async def go():
+            with mock.patch.object(ryoku_link, "reply", fake_reply), \
+                    mock.patch.object(ryoku_link, "search_youtube", lambda query: rows), \
+                    mock.patch.object(ryoku_link, "open_player", lambda url: opened.append(url) or 4):
+                await ryoku_link.on_command(None, msg)
+
+        asyncio.run(go())
+        return sent, opened
+
+    def test_the_video_is_found_and_opened_at_the_real_position(self):
+        sent, opened = self.send(self.MSG, [self.ROW])
+        self.assertEqual(opened, [f"https://www.youtube.com/watch?v={VIDEO}&t=15s"])
+        self.assertEqual(sent, [{"type": "open_url", "workspace": 4}])
+
+    def test_an_unknown_position_opens_the_start_instead_of_failing(self):
+        sent, opened = self.send({**self.MSG, "position_ms": None}, [self.ROW])
+        self.assertEqual(opened, [f"https://www.youtube.com/watch?v={VIDEO}&t=0s"])
+
+    def test_no_confident_match_opens_nothing_and_says_how_to_send_by_hand(self):
+        sent, opened = self.send(self.MSG, [{**self.ROW, "duration": 999}])
+        self.assertEqual(opened, [])
+        self.assertEqual(sent, [{"type": "open_url", "error": "could not tell which video this is: use Share > Send to PC"}])
+
+    def test_a_message_without_a_usable_title_or_length_is_refused_before_any_search(self):
+        for bad in ({"title": None}, {"title": "   "}, {"title": 5}, {"duration_ms": 0}, {"duration_ms": "9"}, {"duration_ms": -1}, {"duration_ms": 10 ** 12}):
+            search = mock.Mock()
+            with mock.patch.object(ryoku_link, "search_youtube", search):
+                with self.assertRaises(ryoku_link.HandoffError, msg=bad):
+                    ryoku_link.video_target({**self.MSG, **bad})
+            search.assert_not_called()
+
+    def test_hostile_text_only_ever_becomes_a_search_query_never_part_of_the_address(self):
+        queries = []
+        hostile = {**self.MSG, "title": "x$(touch /tmp/pwned)`id`;\n\x00reboot", "channel": "\"; rm -rf ~ #"}
+        with mock.patch.object(ryoku_link, "search_youtube", lambda q: queries.append(q) or [{"id": VIDEO, "title": ryoku_link.clean_text(hostile["title"]),
+                                                                                                 "channel": hostile["channel"], "duration": 200}]):
+            ryoku_link.resolved_videos.clear()
+            target = ryoku_link.video_target(hostile)
+        self.assertEqual(target, f"https://www.youtube.com/watch?v={VIDEO}&t=15s")
+        self.assertTrue(queries[0].isprintable(), repr(queries[0]))
+
+    def test_a_lookup_ahead_of_the_tap_makes_the_tap_search_nothing(self):
+        ryoku_link.resolved_videos.clear()
+        rows = [{"id": VIDEO, "title": "Some Song", "channel": "Some Band", "duration": 200}]
+        search = mock.Mock(return_value=rows)
+
+        async def go():
+            with mock.patch.object(ryoku_link, "search_youtube", search), mock.patch.object(ryoku_link, "reply", mock.AsyncMock()), \
+                    mock.patch.object(ryoku_link, "open_player", lambda url: 4):
+                await ryoku_link.on_command(None, {"cmd": "resolve_video", "title": "Some Song", "channel": "Some Band", "duration_ms": 200_000})
+                await ryoku_link.on_command(None, self.MSG)
+
+        asyncio.run(go())
+        self.assertEqual(search.call_count, 1)
+
+    def test_a_lookup_that_finds_nothing_is_dropped_quietly(self):
+        ryoku_link.resolved_videos.clear()
+        with mock.patch.object(ryoku_link, "search_youtube", lambda q: []):
+            ryoku_link.warm_video(self.MSG)  # must not raise
+            ryoku_link.warm_video({"title": 5})
+        self.assertEqual(ryoku_link.resolved_videos, {})
 
 
 if __name__ == "__main__":

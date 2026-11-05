@@ -55,6 +55,8 @@ class DesktopLink(private val port: Int = 7466) {
     var openUrlReply by mutableStateOf<OpenUrlReply?>(null); private set
     /** False while connected to a bridge that predates `open_url` (it would never answer one); set before [connected]. */
     var canOpenUrl by mutableStateOf(false); private set
+    /** Same for `open_video`, the request the button sends. */
+    var canOpenVideo by mutableStateOf(false); private set
 
     private val io = Executors.newSingleThreadExecutor()
     private val sender = Executors.newSingleThreadExecutor()
@@ -88,15 +90,35 @@ class DesktopLink(private val port: Int = 7466) {
     }
 
     /**
-     * Asks the computer to open the video at [url] in its default browser, on a new workspace, at
-     * [positionSeconds] (null: whatever the link itself says). The computer validates both and builds the
+     * Asks the computer to open the video at [url] in its default browser, on a new workspace, at the minute
+     * [now] reports (null: whatever the link itself says). The computer validates everything and builds the
      * address it opens; the answer lands in [openUrlReply].
      */
-    fun openUrl(url: String, positionSeconds: Long?) {
+    fun openUrl(url: String, now: NowPlaying?) {
         openUrlReply = null
         val msg = JSONObject().put("cmd", "open_url").put("url", url)
-        if (positionSeconds != null) msg.put("position_seconds", positionSeconds)
+        if (now != null) putPosition(msg, now)
         send(msg)
+    }
+
+    /**
+     * Asks the computer to find the video [now] describes (title, channel, length) on YouTube and open it at
+     * its minute, as [openUrl] does. The computer refuses when it cannot be sure which video it is.
+     */
+    fun openVideo(now: NowPlaying) {
+        openUrlReply = null
+        val msg = JSONObject().put("cmd", "open_video").put("title", now.title ?: "").put("channel", now.channel ?: "").put("duration_ms", now.durationMs)
+        putPosition(msg, now)
+        send(msg)
+    }
+
+    /** Tells the computer which video is playing so it can look it up before the button is pressed; not answered. */
+    fun resolveVideo(now: NowPlaying) =
+        send(JSONObject().put("cmd", "resolve_video").put("title", now.title ?: "").put("channel", now.channel ?: "").put("duration_ms", now.durationMs))
+
+    private fun putPosition(msg: JSONObject, now: NowPlaying) {
+        // Unknown stays absent: the computer must not read "no position" as the start of the video.
+        now.positionMs?.let { msg.put("position_ms", it).put("age_ms", now.ageMs).put("speed", now.speed.toDouble()).put("playing", now.playing) }
     }
 
     fun closeView() {
@@ -249,7 +271,9 @@ class DesktopLink(private val port: Int = 7466) {
                 List(wins?.length() ?: 0) { j -> wins!!.getJSONObject(j).let { DesktopWindow(it.optString("class"), it.optString("title")) } })
         }
         host = o.optString("host")
-        canOpenUrl = o.optJSONArray("features")?.let { f -> (0 until f.length()).any { f.optString(it) == "open_url" } } ?: false
+        val features = o.optJSONArray("features")?.let { f -> List(f.length()) { f.optString(it) } } ?: emptyList()
+        canOpenUrl = "open_url" in features
+        canOpenVideo = "open_video" in features
         connected = true
     }
 }

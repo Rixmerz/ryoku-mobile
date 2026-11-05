@@ -3,17 +3,18 @@ package com.rixmerz.ryokumobile
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
 import android.graphics.PixelFormat
-import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.media.MediaMetadata
+import android.media.session.MediaController
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.TextView
 import androidx.compose.ui.graphics.toArgb
@@ -85,6 +86,7 @@ class CastService : AccessibilityService() {
         PcHandoff.say = null
         removeBubble()
         removeNotice()
+        unwatchVideo()
         return super.onUnbind(intent)
     }
 
@@ -94,7 +96,37 @@ class CastService : AccessibilityService() {
 
     private fun refreshBubble() {
         if (front == null) removeBubble() else if (bubble == null) addBubble()
+        if (front == null) unwatchVideo() else watchVideo()
     }
+
+    private var watched: MediaController? = null
+    private val videoChanged = object : MediaController.Callback() {
+        override fun onMetadataChanged(metadata: MediaMetadata?) = warmSoon()
+    }
+    private val warm = Runnable { thread(name = "warm-pc") { PcHandoff.warm(applicationContext) } }
+
+    /**
+     * While YouTube is in front, the computer is told which video it is playing (and each time it changes), so it
+     * has looked the video up before the button is pressed. YouTube sets title and length a moment apart, hence
+     * the short wait before telling.
+     */
+    private fun watchVideo() {
+        val session = PcHandoff.youtubeSession(applicationContext)
+        if (session?.sessionToken != watched?.sessionToken) {
+            unwatchVideo()
+            session?.registerCallback(videoChanged)
+            watched = session
+        }
+        if (session != null) warmSoon()
+    }
+
+    private fun unwatchVideo() {
+        ui.removeCallbacks(warm)
+        watched?.unregisterCallback(videoChanged)
+        watched = null
+    }
+
+    private fun warmSoon() { ui.removeCallbacks(warm); ui.postDelayed(warm, 1_500) }
 
     private fun addBubble() {
         val t = Tokens(signature)
@@ -159,84 +191,24 @@ class CastService : AccessibilityService() {
     }
 
     /**
-     * The button: pause the video and note its minute, read the video's link off YouTube's own share
-     * sheet, and hand both to the computer. Nothing stays connected between taps.
+     * The button: the video's title, channel, length and minute come from its media session (nothing is
+     * driven on screen), the computer finds and opens it, and the phone's copy is paused. Nothing stays
+     * connected between taps.
      */
     private fun sendToPc(pkg: String) {
         if (sending) return
         if (pkg !in CASTABLE) return say("Only YouTube can be sent to the PC for now")
         sending = true
+        val tappedAt = SystemClock.elapsedRealtime()
         say("Sending to the PC…")
         thread(name = "send-to-pc") {
             try {
-                PcHandoff.hold(applicationContext)
-                val url = try {
-                    readShareLink()
-                } catch (e: ShareWalkFailed) {
-                    PcHandoff.resume(applicationContext)
-                    return@thread say("Could not read the video link (${e.message}): open Share in YouTube and pick Send to PC")
-                }
-                PcHandoff.deliver(applicationContext, url)
+                PcHandoff.sendPlaying(applicationContext, tappedAt)
             } finally {
                 sending = false
             }
         }
     }
-
-    /** A step of the share-sheet walk that found nothing; the message says which, for the person to see. */
-    private class ShareWalkFailed(message: String) : Exception(message)
-
-    /**
-     * YouTube's Share button opens its own sheet; the last entry of the app row there ("More") opens
-     * Android's chooser, whose header shows the link as text. The sheet is closed again afterwards.
-     * Throws [ShareWalkFailed] when a step is not found (another language for Share, a player without the button).
-     */
-    private fun readShareLink(): String {
-        val share = awaitNode { root -> root.descendants().firstOrNull { it.contentDescription?.toString()?.lowercase() in SHARE_LABELS } }
-            ?: throw ShareWalkFailed("no Share button")
-        if (!tap(share)) throw ShareWalkFailed("Share button would not click")
-        val row = awaitNode { root -> root.descendants().filter { it.isScrollable && it.childCount > 1 }.minByOrNull { it.area() } }
-            ?: throw ShareWalkFailed("no app row")
-        // The row only builds the entries on screen: scroll to its end, where "More" is the last one.
-        var guard = 0
-        while (row.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) && guard++ < 20) { Thread.sleep(350); row.refresh() }
-        // RecyclerView keeps recycled entries among its children: the one furthest right on screen is "More".
-        val more = (0 until row.childCount).mapNotNull { row.getChild(it)?.let(::clickableIn) }
-            .filter { it.isVisibleToUser }.maxByOrNull { Rect().also(it::getBoundsInScreen).left }
-            ?: throw ShareWalkFailed("no clickable entry in the app row (${row.childCount} children, scrolled $guard times)")
-        if (!more.performAction(AccessibilityNodeInfo.ACTION_CLICK)) throw ShareWalkFailed("More would not click (${more.className} ${more.contentDescription})")
-        val text = awaitNode { root -> root.descendants().firstOrNull { it.text?.let(SHARED_LINK::matches) == true } }?.text?.toString()
-            ?: throw ShareWalkFailed("no link in the chooser")
-        // Close the chooser, then YouTube's own sheet when it is still up (a second BACK would leave the app).
-        performGlobalAction(GLOBAL_ACTION_BACK)
-        Thread.sleep(600)
-        if (rootInActiveWindow?.descendants()?.any { it.viewIdResourceName?.endsWith(":id/bottom_sheet_list") == true } == true) performGlobalAction(GLOBAL_ACTION_BACK)
-        return text
-    }
-
-    /** The first non-null `find` over the window in front, retried for a few seconds while the screen settles. */
-    private fun awaitNode(find: (AccessibilityNodeInfo) -> AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        var found: AccessibilityNodeInfo? = null
-        PcHandoff.waitFor(5_000) { found = rootInActiveWindow?.let(find); found != null }
-        return found
-    }
-
-    /** The node itself or the first node inside it that can be clicked (a list entry's wrapper is not). */
-    private fun clickableIn(node: AccessibilityNodeInfo): AccessibilityNodeInfo? =
-        (sequenceOf(node) + node.descendants()).firstOrNull { it.isClickable }
-
-    /** Clicks the node, or the closest ancestor that can be clicked. */
-    private fun tap(node: AccessibilityNodeInfo): Boolean {
-        var at: AccessibilityNodeInfo? = node
-        while (at != null && !at.isClickable) at = at.parent
-        return at?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
-    }
-
-    private fun AccessibilityNodeInfo.descendants(): Sequence<AccessibilityNodeInfo> = sequence {
-        for (i in 0 until childCount) { val child = getChild(i) ?: continue; yield(child); yieldAll(child.descendants()) }
-    }
-
-    private fun AccessibilityNodeInfo.area(): Int = Rect().also { getBoundsInScreen(it) }.let { it.width() * it.height() }
 
     /**
      * A line over every app for a few seconds. A Toast is not used: Android drops the toasts of an app
@@ -284,11 +256,5 @@ class CastService : AccessibilityService() {
         const val NOTICE_MS = 5_000L
         // Apps that may be sent for now: YouTube, whose links the bridge opens (see PcHandoff).
         val CASTABLE = setOf(PcHandoff.YOUTUBE)
-        // YouTube labels its Share button in the phone's language. A language missing here makes the button
-        // answer with how to share by hand; add the label to support it.
-        // The chooser's header shows exactly the shared link; the bridge checks it again.
-        val SHARED_LINK = Regex("https?://(www\\.|m\\.)?(youtube\\.com|youtu\\.be)/\\S+")
-        val SHARE_LABELS = setOf("share", "compartir", "partager", "teilen", "condividi", "compartilhar", "partilhar",
-            "поделиться", "共有", "分享", "공유", "delen", "paylaş", "udostępnij", "dela")
     }
 }
