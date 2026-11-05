@@ -843,6 +843,12 @@ async def end_view() -> None:
 # Closing the window ends the virtual display; --no-vd-destroy-content, when this scrcpy has it, makes
 # Android move the app back to the phone instead of closing it.
 #
+# The app has one task, so opening it on the phone during a cast (its icon, recents, its notification)
+# pulls that task back to the phone's display. With system decorations the virtual display then falls
+# back to the phone launcher's SecondaryDisplayLauncher, and the PC streamed the phone's home screen;
+# --no-vd-system-decorations leaves no launcher on the display, so it simply stays empty until the
+# watcher ends the cast. scrcpy's --start-app is no way around it: it moves that same task.
+#
 # The display is 1920x1080 at the phone's own density. At scrcpy's old 240 dpi it is 1280 dp wide, so
 # YouTube drew its tablet layout (a player pane beside a comments pane that spun forever); at the
 # phone's 400 dpi the smallest width stays phone-sized and the player fills the window like a phone
@@ -856,6 +862,7 @@ OWN_PACKAGE = "com.rixmerz.ryokumobile"
 # The only apps that may be cast for now; add a package here to allow another one.
 CASTABLE_PACKAGES = frozenset({"com.google.android.youtube"})
 KEEP_APPS_FLAG = "--no-vd-destroy-content"
+BARE_DISPLAY_FLAG = "--no-vd-system-decorations"  # no launcher on the virtual display (see above)
 GRIM = shutil.which("grim")  # screenshots of the cast window, to notice a frozen picture; None: not checked
 FROZEN_AFTER = 15.0  # seconds of an unchanged picture, while the video plays, before the cast is restarted
 MAX_RECOVERIES = 2  # restarts for one stuck picture before the bridge leaves the cast alone
@@ -931,9 +938,10 @@ def cast_display(density: int | None) -> str:
     return f"{CAST_SIZE}/{density}" if density else CAST_SIZE  # no density: scrcpy picks one for the size
 
 
-def scrcpy_argv(scrcpy: str, serial: str, title: str, keep_apps: bool, display: str = CAST_SIZE) -> list[str]:
+def scrcpy_argv(scrcpy: str, serial: str, title: str, keep_apps: bool, display: str = CAST_SIZE,
+                bare: bool = False) -> list[str]:
     argv = [scrcpy, "-s", serial, f"--new-display={display}", "--audio-source=playback", f"--window-title={title}"]
-    return argv + [KEEP_APPS_FLAG] if keep_apps else argv
+    return argv + [KEEP_APPS_FLAG] * keep_apps + [BARE_DISPLAY_FLAG] * bare
 
 
 def exec_in_workspace(argv: list[str], workspace: int, log_path: str) -> str:
@@ -1072,15 +1080,20 @@ def close_cast_window(address: str) -> None:
         poll(lambda: window_at(address) is None, wait, interval=0.2)
 
 
-def resume_playback(serial: str, display: int, package: str, timeout: float = 12.0) -> bool:
-    """Presses play until the app's media session says PLAYING; True once it does. Blocking.
+def resume_playback(serial: str, display: int, package: str, timeout: float = 12.0) -> str:
+    """Presses play until the app's media session says PLAYING. Blocking. Returns "playing", "left"
+    (the app is no longer in front on `display`) or "not playing".
     KEYCODE_MEDIA_PLAY (126), never PLAY_PAUSE, so an already playing video is not paused. It is only
     pressed for a session that is paused or stopped: with no session Android would hand the key to
     whatever media app played last. YouTube pauses a moment after the move, often after a first
-    PLAYING reading, so it only counts once STEADY_READS readings in a row said PLAYING."""
+    PLAYING reading, so it only counts once STEADY_READS readings in a row said PLAYING.
+    The key reaches the media session wherever the app is: once the app has gone back to the phone,
+    pressing it would start the video on the phone, its sound still captured by the closing cast."""
     playing_reads = [0]
 
-    def settle() -> bool:
+    def settle() -> str | None:
+        if top_package(adb(serial, "shell", "am", "stack", "list"), display) != package:
+            return "left"
         state = playback_state(serial, package)
         if state in ("PAUSED", "STOPPED"):
             playing_reads[0] = 0
@@ -1090,8 +1103,8 @@ def resume_playback(serial: str, display: int, package: str, timeout: float = 12
             playing_reads[0] = 0
             return False
         playing_reads[0] += 1
-        return playing_reads[0] >= STEADY_READS
-    return bool(poll(settle, timeout, interval=0.5))
+        return "playing" if playing_reads[0] >= STEADY_READS else None
+    return poll(settle, timeout, interval=0.5) or "not playing"
 
 
 STEADY_READS = 8  # readings 0.5 s apart: PLAYING must hold about 4 s before autoplay trusts it
@@ -1127,9 +1140,11 @@ def launch_cast(package: str) -> Cast:
         close_cast_window(leftover["address"])
     log_path = os.path.join(SOCKET_DIR, f"cast-{package}.log")
     display_spec = cast_display(phone_density(adb(serial, "shell", "wm", "density")))
-    argv = scrcpy_argv(SCRCPY, serial, title, KEEP_APPS_FLAG in help_text, display_spec)
+    argv = scrcpy_argv(SCRCPY, serial, title, KEEP_APPS_FLAG in help_text, display_spec, BARE_DISPLAY_FLAG in help_text)
     if KEEP_APPS_FLAG not in help_text:
         log(f"this scrcpy lacks {KEEP_APPS_FLAG}: closing the window will close {package} instead of returning it to the phone")
+    if BARE_DISPLAY_FLAG not in help_text:
+        log(f"this scrcpy lacks {BARE_DISPLAY_FLAG}: the phone launcher may show on the PC when {package} leaves the cast")
     if not dispatch(exec_in_workspace(argv, workspace, log_path)):
         raise CastError("the desktop refused to start scrcpy")
     window = None
@@ -1211,6 +1226,7 @@ async def start_cast(writer: asyncio.StreamWriter, package: str) -> None:
     if package not in CASTABLE_PACKAGES:
         await reply(writer, {"type": "cast", "package": package, "error": "only YouTube can be sent to the PC for now"})
         return
+    cast = None
     async with cast_lock:
         if existing := casts.get(package):
             # A cast the bridge still remembers is reused when it works and cleaned up when it does not:
@@ -1226,34 +1242,45 @@ async def start_cast(writer: asyncio.StreamWriter, package: str) -> None:
                 await asyncio.to_thread(dispatch, *show_cast(existing))
                 log(f"cast {package}: already live on workspace {existing.workspace}, focused it")
                 await reply(writer, {"type": "cast", "package": package, "workspace": existing.workspace})
-                await asyncio.to_thread(autoplay, existing)
-                return
-            await end_cast(existing, problem)
-        # The phone is leaving for the app: a live view (its headless output, a pulled workspace, a
-        # screen zoom) must not be left on the PC next to the cast, nor shift which workspace is free.
-        if view is not None:
-            await end_view()
-        await asyncio.to_thread(set_zoom, 1.0)
-        try:
-            cast = await asyncio.to_thread(launch_cast, package)
-        except (CastError, OSError, subprocess.SubprocessError) as e:
-            log(f"cast of {package} failed: {e}")
-            await reply(writer, {"type": "cast", "package": package, "error": str(e) if isinstance(e, CastError) else "could not reach adb"})
-            return
-        casts[package] = cast
-        log(f"cast {package}: virtual display {cast.display}, PC workspace {cast.workspace}")
-        await reply(writer, {"type": "cast", "package": package, "workspace": cast.workspace})
+                cast = existing
+            else:
+                await end_cast(existing, problem)
+        if cast is None:
+            cast = await launch_new_cast(writer, package)
+    # Outside the lock: pressing play takes seconds, and the watcher must be free meanwhile to notice
+    # the app leaving the display (opened again on the phone) and end the cast.
+    if cast is not None:
         await asyncio.to_thread(autoplay, cast)
+
+
+async def launch_new_cast(writer: asyncio.StreamWriter, package: str) -> Cast | None:
+    """Opens a new cast of `package` and answers the phone; None when it failed. The caller holds cast_lock."""
+    # The phone is leaving for the app: a live view (its headless output, a pulled workspace, a
+    # screen zoom) must not be left on the PC next to the cast, nor shift which workspace is free.
+    if view is not None:
+        await end_view()
+    await asyncio.to_thread(set_zoom, 1.0)
+    try:
+        cast = await asyncio.to_thread(launch_cast, package)
+    except (CastError, OSError, subprocess.SubprocessError) as e:
+        log(f"cast of {package} failed: {e}")
+        await reply(writer, {"type": "cast", "package": package, "error": str(e) if isinstance(e, CastError) else "could not reach adb"})
+        return None
+    casts[package] = cast
+    log(f"cast {package}: virtual display {cast.display}, PC workspace {cast.workspace}")
+    await reply(writer, {"type": "cast", "package": package, "workspace": cast.workspace})
+    return cast
 
 
 def autoplay(cast: Cast) -> None:
     """Moving the task pauses the video: resume it and say whether it is playing. Blocking."""
     try:
-        playing = resume_playback(cast.serial, cast.display, cast.package)
+        outcome = resume_playback(cast.serial, cast.display, cast.package)
     except (OSError, subprocess.SubprocessError) as e:
         log(f"cast {cast.package}: could not resume playback ({e})")
         return
-    log(f"cast {cast.package}: {'playing' if playing else 'not playing (paused, or no playback to resume)'}")
+    said = {"playing": "playing", "left": "left the virtual display before it played; play is not pressed"}
+    log(f"cast {cast.package}: {said.get(outcome, 'not playing (paused, or no playback to resume)')}")
 
 
 async def reap_casts() -> None:

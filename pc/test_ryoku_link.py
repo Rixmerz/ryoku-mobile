@@ -517,6 +517,11 @@ class CastArgv(unittest.TestCase):
     def test_the_keep_flag_is_left_out_when_this_scrcpy_has_none(self):
         self.assertNotIn("--no-vd-destroy-content", ryoku_link.scrcpy_argv("scrcpy", "S", "t", keep_apps=False))
 
+    def test_a_bare_display_has_no_system_decorations_so_no_phone_launcher(self):
+        # With decorations, the app going back to the phone left SecondaryDisplayLauncher streaming to the PC.
+        self.assertIn("--no-vd-system-decorations", ryoku_link.scrcpy_argv("scrcpy", "S", "t", True, bare=True))
+        self.assertNotIn("--no-vd-system-decorations", ryoku_link.scrcpy_argv("scrcpy", "S", "t", True, bare=False))
+
     def test_the_hyprland_command_places_the_window_silently_and_quotes_every_word(self):
         argv = ryoku_link.scrcpy_argv("/opt/my scrcpy/scrcpy", "S1", "ryoku-cast com.x.y", keep_apps=True)
         lua = ryoku_link.exec_in_workspace(argv, 7, "/run/user/1/ryoku-link/cast-com.x.y.log")
@@ -638,7 +643,7 @@ class CastCommand(unittest.TestCase):
 class FakeScrcpy(unittest.TestCase):
     """launch_cast end to end against a scrcpy stub: the order of the steps and what each one is given."""
 
-    def make_stub(self, directory, text="  --new-display  --no-vd-destroy-content\n"):
+    def make_stub(self, directory, text="  --new-display  --no-vd-destroy-content  --no-vd-system-decorations\n"):
         path = os.path.join(directory, "scrcpy")
         with open(path, "w") as f:
             f.write(f"#!/bin/sh\ncat <<'EOF'\n{text}EOF\n")
@@ -696,6 +701,7 @@ class FakeScrcpy(unittest.TestCase):
         self.assertIn('workspace = "6 silent" }', dispatched[0][0])  # 1-5 hold windows, 5 is on the monitor
         self.assertIn("--new-display=1920x1080/400", dispatched[0][0])  # the phone's own density
         self.assertIn("-s 324751914997", dispatched[0][0])  # the USB phone, not the TCP one
+        self.assertIn("--no-vd-system-decorations", dispatched[0][0])  # this scrcpy has it: no launcher on the display
 
     def test_once_the_app_is_on_the_window_the_pc_switches_to_it_and_remembers_where_it_was(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -762,6 +768,13 @@ STACK_CAST_LEFT = """RootTask id=2101 bounds=[1559,-82][1990,160] displayId=0 us
   taskId=2101: com.google.android.youtube/com.google.android.youtube.app.honeycomb.Shell$HomeActivity bounds=[1559,-82][1990,160] userId=0 visible=true
 RootTask id=2102 bounds=[0,0][1920,1080] displayId=3 userId=0
   taskId=2103: com.zte.mifavor.launcher/com.android.launcher3.secondarydisplay.SecondaryDisplayLauncher bounds=[0,0][1920,1080] userId=0 visible=true
+"""
+# Captured on the phone with a bare (no decorations) display 37: YouTube opened again on the phone took
+# its task back to display 0, and the virtual display holds no task at all.
+STACK_CAST_PULLED = """RootTask id=2241 bounds=[0,0][900,2030] displayId=0 userId=0
+  taskId=2241: com.google.android.youtube/com.google.android.apps.youtube.app.watchwhile.WatchWhileActivity bounds=[0,0][900,2030] userId=0 visible=true
+RootTask id=1 bounds=[0,0][900,2030] displayId=0 userId=0
+  taskId=2: com.zte.mifavor.launcher/com.android.launcher3.uioverrides.QuickstepLauncher bounds=[0,0][900,2030] userId=0 visible=false
 """
 STACK_CAST_EMPTY = "RootTask id=1 bounds=[0,0][2030,900] displayId=0 userId=0\n  taskId=2: com.zte.mifavor.launcher/.Launcher bounds=[0,0][1,1] userId=0 visible=true\n"
 MEDIA_SESSIONS = """  Sessions Stack - have 3 sessions:
@@ -838,38 +851,56 @@ class CastHealth(unittest.TestCase):
 
 
 class ResumePlayback(unittest.TestCase):
-    def resume(self, states):
-        phone = FakePhone(states=states)
+    def resume(self, states, phone=None):
+        phone = phone or FakePhone(states=states)
         with mock.patch.object(ryoku_link, "adb", phone), mock.patch.object(ryoku_link.time, "sleep"), \
                 mock.patch.object(ryoku_link, "STEADY_READS", 2):
             return ryoku_link.resume_playback("S", 3, YT, timeout=2.0), phone.calls
 
     def test_a_paused_video_gets_play_on_its_display_until_the_session_says_playing(self):
         ok, calls = self.resume(["PAUSED", "PAUSED", "PLAYING"])
-        self.assertTrue(ok)
+        self.assertEqual(ok, "playing")
         self.assertIn(("shell", "input", "-d", "3", "keyevent", "126"), calls)  # play, never play/pause (85)
         self.assertNotIn(("shell", "input", "-d", "3", "keyevent", "85"), calls)
 
     def test_a_video_that_already_plays_is_left_alone(self):
         ok, calls = self.resume(["PLAYING"])
-        self.assertTrue(ok)
+        self.assertEqual(ok, "playing")
         self.assertFalse([c for c in calls if "keyevent" in c])
 
     def test_a_video_that_pauses_right_after_a_first_playing_reading_gets_play(self):
         ok, calls = self.resume(["PLAYING", "PAUSED", "PLAYING"])
-        self.assertTrue(ok)
+        self.assertEqual(ok, "playing")
         self.assertIn(("shell", "input", "-d", "3", "keyevent", "126"), calls)
 
     def test_no_session_means_no_key_press_and_no_claim_of_playing(self):
         phone = FakePhone()
         with mock.patch.object(ryoku_link, "adb", phone), mock.patch.object(ryoku_link, "playback_state", lambda s, p: None), \
                 mock.patch.object(ryoku_link.time, "sleep"):
-            self.assertFalse(ryoku_link.resume_playback("S", 3, YT, timeout=0.0))
+            self.assertEqual(ryoku_link.resume_playback("S", 3, YT, timeout=0.0), "not playing")
         self.assertFalse([c for c in phone.calls if "keyevent" in c])  # the key would start whatever played last
 
     def test_a_video_that_never_resumes_is_reported_not_playing(self):
         ok, _ = self.resume(["PAUSED"])
-        self.assertFalse(ok)
+        self.assertEqual(ok, "not playing")
+
+    def test_an_app_that_went_back_to_the_phone_never_gets_play(self):
+        # Seen on the phone: the key reached YouTube on display 0 and started the video there, its sound
+        # still captured by the cast that was closing.
+        phone = FakePhone(stack=STACK_CAST_PULLED, states=["STOPPED"])
+        ok, calls = self.resume(None, phone)
+        self.assertEqual(ok, "left")
+        self.assertFalse([c for c in calls if "keyevent" in c])
+
+    def test_play_stops_being_pressed_once_the_app_leaves_mid_way(self):
+        class Leaving(FakePhone):
+            def __call__(self, serial, *args, timeout=8):
+                if args[-1] == "126":
+                    self.stack = STACK_CAST_PULLED  # the user opened YouTube on the phone right after this press
+                return super().__call__(serial, *args, timeout=timeout)
+        ok, calls = self.resume(None, Leaving(states=["PAUSED"]))
+        self.assertEqual(ok, "left")
+        self.assertEqual(len([c for c in calls if "keyevent" in c]), 1)
 
 
 class CastRecovery(unittest.TestCase):
@@ -923,6 +954,14 @@ class CastRecovery(unittest.TestCase):
         self.assertIn(("dispatch", (ryoku_link.focus_workspace(9), ryoku_link.focus_window("0xfeed"))), self.events)
         self.assertIn(("autoplay", YT), self.events)  # reusing it also makes sure the video plays
         self.assertNotIn(("close", "0xfeed"), self.events)
+
+    def test_play_is_pressed_after_the_lock_is_released_so_the_watcher_can_end_the_cast(self):
+        # Pressing play takes seconds; under the lock the watcher could not end a cast whose app left.
+        held = []
+        with mock.patch.object(ryoku_link, "autoplay", lambda cast: held.append(ryoku_link.cast_lock.locked())):
+            self.run_cast(lambda cast: "nothing is in front on the virtual display, not the app")  # new cast
+            self.run_cast(lambda cast: None, launch=lambda package: None)  # reused cast
+        self.assertEqual(held, [False, False])
 
     def test_ending_a_cast_closes_the_window_returns_the_pc_and_resets_the_zoom(self):
         cast = a_cast()
