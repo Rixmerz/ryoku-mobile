@@ -13,6 +13,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.TextView
 import androidx.compose.ui.graphics.toArgb
 import kotlin.concurrent.thread
@@ -41,6 +42,14 @@ class CastService : AccessibilityService() {
     private var savedY = -1
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
+        // A task coming back from the computer's virtual display (a cast that ended) resumes on the
+        // phone without a window-state change: only the window list changes. Re-read what is in front.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            val pkg = phoneFrontApp() ?: return
+            front = if (pkg in CASTABLE) pkg else if (pkg == packageName) front else null
+            refreshBubble()
+            return
+        }
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         val pkg = event.packageName?.toString() ?: return
         when {
@@ -60,6 +69,15 @@ class CastService : AccessibilityService() {
             else -> return
         }
         refreshBubble()
+    }
+
+    /** The package of the active application window on the phone's own screen, or null when unknown. */
+    private fun phoneFrontApp(): String? {
+        val windows = windowsOnAllDisplays.get(Display.DEFAULT_DISPLAY) ?: return null
+        val app = windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isActive }
+            ?: windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
+            ?: return null
+        return app.root?.packageName?.toString()
     }
 
     /** False when the event's window is on another display than the phone's own (a virtual display). */

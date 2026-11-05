@@ -1456,6 +1456,12 @@ async def main() -> None:
         log(f"removing stale output {OUTPUT} from a previous run")
         subprocess.run(["hyprctl", "output", "remove", OUTPUT], capture_output=True, timeout=3)
     set_zoom(1.0)  # a zoom left by a run that died while the phone was pinching
+    # A cast window outlives a restart of this bridge, which no longer tracks it: left open it ends up
+    # showing the phone's launcher and blocks the next cast.
+    for client in hyprctl("clients") or []:
+        if client.get("title", "").startswith(cast_title("")):
+            log(f"closing cast window left by a previous run: {client['title']}")
+            close_cast_window(client["address"])
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, stop.set)
