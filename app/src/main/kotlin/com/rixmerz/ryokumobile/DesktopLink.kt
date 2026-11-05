@@ -28,6 +28,9 @@ data class Workspace(val id: Int, val name: String, val active: Boolean, val bus
 /** The computer's answer to [DesktopLink.openUrl]: the [workspace] the page opened on, or the [error] why it did not. */
 data class OpenUrlReply(val workspace: Int?, val error: String?)
 
+/** The computer's answer to [DesktopLink.volume]: the [level] it is at now in percent, or the [error] why it could not change. */
+data class VolumeReply(val level: Int?, val muted: Boolean, val error: String?)
+
 /** A live view the computer agreed to serve: the stream's size and the port its video is on. */
 data class LiveInfo(val workspace: Int, val width: Int, val height: Int, val port: Int)
 
@@ -57,6 +60,10 @@ class DesktopLink(private val port: Int = 7466) {
     var canOpenUrl by mutableStateOf(false); private set
     /** Same for `open_video`, the request the button sends. */
     var canOpenVideo by mutableStateOf(false); private set
+    /** Same for `volume`, the request the phone's volume buttons send during a PC session (see PcSession). */
+    var canSetVolume by mutableStateOf(false); private set
+    /** Called, on this link's reader thread, with every answer to [volume]. */
+    @Volatile var onVolume: ((VolumeReply) -> Unit)? = null
 
     private val io = Executors.newSingleThreadExecutor()
     private val sender = Executors.newSingleThreadExecutor()
@@ -120,6 +127,9 @@ class DesktopLink(private val port: Int = 7466) {
         // Unknown stays absent: the computer must not read "no position" as the start of the video.
         now.positionMs?.let { msg.put("position_ms", it).put("age_ms", now.ageMs).put("speed", now.speed.toDouble()).put("playing", now.playing) }
     }
+
+    /** Steps the computer's volume by [step] (1 or -1, five points each); the answer goes to [onVolume]. */
+    fun volume(step: Int) = send(JSONObject().put("cmd", "volume").put("step", step))
 
     fun closeView() {
         live = null
@@ -250,6 +260,7 @@ class DesktopLink(private val port: Int = 7466) {
         when (o.optString("type")) {
             "state" -> parseState(o)
             "view" -> parseView(o)
+            "volume" -> onVolume?.invoke(VolumeReply(if (o.has("level")) o.getInt("level") else null, o.optBoolean("muted"), o.optString("error").ifEmpty { null }))
             "open_url" -> openUrlReply = OpenUrlReply(if (o.has("workspace")) o.getInt("workspace") else null, o.optString("error").ifEmpty { null })
         }
     }
@@ -274,6 +285,7 @@ class DesktopLink(private val port: Int = 7466) {
         val features = o.optJSONArray("features")?.let { f -> List(f.length()) { f.optString(it) } } ?: emptyList()
         canOpenUrl = "open_url" in features
         canOpenVideo = "open_video" in features
+        canSetVolume = "volume" in features
         connected = true
     }
 }

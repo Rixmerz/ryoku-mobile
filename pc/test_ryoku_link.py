@@ -275,6 +275,7 @@ class Capabilities(unittest.TestCase):
         with mock.patch.object(ryoku_link, "hyprctl", hypr), mock.patch.object(ryoku_link, "view", None):
             self.assertIn("open_url", ryoku_link.snapshot()["features"])
             self.assertIn("open_video", ryoku_link.snapshot()["features"])
+            self.assertIn("volume", ryoku_link.snapshot()["features"])
             self.assertNotIn("cast", ryoku_link.snapshot()["features"])
 
 
@@ -691,6 +692,7 @@ class OpenUrlCommand(unittest.TestCase):
         async def go():
             with mock.patch.object(ryoku_link, "reply", mock.AsyncMock()), mock.patch.object(ryoku_link, "hyprctl", hypr), \
                     mock.patch.object(ryoku_link, "PLAYER_FILE", os.path.join(tempfile.mkdtemp(), "player.json")), \
+                    mock.patch.object(ryoku_link, "enter_fullscreen", lambda address: True), \
                     mock.patch.object(ryoku_link.subprocess, "run", run), \
                     mock.patch.object(ryoku_link, "read_desktop_file", lambda name: "[Desktop Entry]\nExec=firefox %u\n"), \
                     mock.patch.object(ryoku_link.shutil, "which", lambda name: None), \
@@ -750,6 +752,7 @@ class PlayerWindow(unittest.TestCase):
 
     def test_player_falls_back_to_a_new_window_that_becomes_the_player(self):
         with mock.patch.object(ryoku_link, "show_player", lambda url: None), \
+                mock.patch.object(ryoku_link, "enter_fullscreen", lambda address: True), \
                 mock.patch.object(ryoku_link, "open_on_new_workspace", lambda url, on_window: on_window("0xbeef") or 2):
             self.assertEqual(ryoku_link.open_player(self.URL), 2)
         self.assertEqual(ryoku_link.load_player(), "0xbeef")
@@ -767,6 +770,217 @@ class PlayerWindow(unittest.TestCase):
         for bad in ("https://evil.com/watch?v=" + VIDEO + "&t=1s", self.URL + ";id", self.URL.replace("77s", "x"), "-k Return"):
             with self.assertRaises(ValueError):
                 ryoku_link.navigate_argv(bad)
+
+
+class PlayerFullscreen(unittest.TestCase):
+    """The player window ends every send fullscreen, and a re-send never types into a fullscreen page."""
+    URL = f"https://www.youtube.com/watch?v={VIDEO}&t=77s"
+    ADDRESS = "0xa1"
+
+    def setUp(self):
+        self.file = os.path.join(tempfile.mkdtemp(), "ryoku-link", "player.json")
+        patch = mock.patch.object(ryoku_link, "PLAYER_FILE", self.file)
+        patch.start()
+        self.addCleanup(patch.stop)
+        ryoku_link.save_player(self.ADDRESS)
+
+    def send(self, fullscreen, f_takes=True, active=None, leaves=True):
+        """One send to a player that is `fullscreen` (Hyprland's 0/1/2) before it. Returns what happened, in order."""
+        world = {"fs": fullscreen, "events": []}
+
+        def hypr(*args):
+            if args[0] == "activewindow":
+                return {"address": active or self.ADDRESS}
+            return {"clients": [{"address": self.ADDRESS, "workspace": {"id": 3}, "fullscreen": world["fs"]}], "monitors": monitors(1)}[args[0]]
+
+        def dispatched(*lua):
+            for expr in lua:
+                if "action = \"unset\"" in expr:
+                    world["events"].append("unset")
+                    world["fs"] = 0 if leaves else world["fs"]
+                elif "action = \"set\"" in expr:
+                    world["events"].append("set")
+                    world["fs"] = 2
+            return True
+
+        def run(argv, **kw):
+            if argv == ryoku_link.FULLSCREEN_KEY:
+                world["events"].append("f")
+                if f_takes:
+                    world["fs"] = 2
+            else:
+                world["events"].append(("typed", world["fs"], argv))
+            return mock.Mock(returncode=0, stderr="")
+
+        with mock.patch.object(ryoku_link, "hyprctl", hypr), mock.patch.object(ryoku_link, "dispatch", dispatched), \
+                mock.patch.object(ryoku_link, "FOCUS_TIMEOUT", 0.2), mock.patch.object(ryoku_link, "FULLSCREEN_TIMEOUT", 0.2), \
+                mock.patch.object(ryoku_link.time, "sleep", lambda s: None), mock.patch.object(ryoku_link.subprocess, "run", run):
+            try:
+                result = ryoku_link.open_player(self.URL)
+            except ryoku_link.HandoffError as e:
+                result = e
+        return result, world["fs"], world["events"]
+
+    def test_a_resend_to_a_fullscreen_player_leaves_fullscreen_before_typing_and_presses_f_once(self):
+        result, fs, events = self.send(fullscreen=2)
+        self.assertEqual(result, 3)
+        self.assertEqual(events[0], "unset")
+        typed = [e for e in events if isinstance(e, tuple)]
+        self.assertEqual(len(typed), 3)
+        self.assertTrue(all(fs_then == 0 for _, fs_then, _ in typed), "typed into a fullscreen page")
+        self.assertEqual(events.count("f"), 1)
+        self.assertEqual(events.index("f"), len(events) - 1, "f is pressed after the address is typed")
+        self.assertEqual(fs, 2)
+
+    def test_a_maximized_player_is_typed_into_without_leaving_and_f_is_not_mistaken_for_done(self):
+        result, fs, events = self.send(fullscreen=1)
+        self.assertEqual(result, 3)
+        self.assertNotIn("unset", events)
+        self.assertEqual(len([e for e in events if isinstance(e, tuple)]), 3)
+        self.assertEqual(events.count("f"), 1)
+        self.assertEqual(fs, 2)
+        # f that does not take on a maximized window still falls through to Hyprland's fullscreen
+        _, fs, events = self.send(fullscreen=1, f_takes=False)
+        self.assertEqual((events.count("f"), events[-1], fs), (2, "set", 2))
+
+    def test_a_new_player_window_is_made_fullscreen_too(self):
+        entered = []
+        with mock.patch.object(ryoku_link, "show_player", lambda url: None), \
+                mock.patch.object(ryoku_link, "open_on_new_workspace", lambda url, on_window: on_window("0xbeef") or 5), \
+                mock.patch.object(ryoku_link, "enter_fullscreen", lambda address: entered.append(address) or True):
+            self.assertEqual(ryoku_link.open_player(self.URL), 5)
+        self.assertEqual(entered, ["0xbeef"])
+
+    def test_a_first_send_to_a_windowed_player_just_presses_f(self):
+        _, fs, events = self.send(fullscreen=0)
+        self.assertNotIn("unset", events)
+        self.assertNotIn("set", events)
+        self.assertEqual(events.count("f"), 1)
+        self.assertEqual(fs, 2)
+
+    def test_two_sends_in_a_row_each_end_fullscreen_without_f_toggling_it_off(self):
+        _, fs, first = self.send(fullscreen=0)
+        _, fs, second = self.send(fullscreen=fs)
+        self.assertEqual((first.count("f"), second.count("f")), (1, 1))
+        self.assertEqual(fs, 2)
+
+    def test_when_f_does_not_take_it_is_tried_once_more_then_hyprlands_fullscreen_is_used(self):
+        result, fs, events = self.send(fullscreen=0, f_takes=False)
+        self.assertEqual(result, 3)
+        self.assertEqual(events.count("f"), 2)
+        self.assertEqual(events[-1], "set")
+        self.assertEqual(fs, 2)
+
+    def test_a_player_that_will_not_leave_fullscreen_is_not_typed_into(self):
+        result, _, events = self.send(fullscreen=2, leaves=False)
+        self.assertIsInstance(result, ryoku_link.HandoffError)
+        self.assertEqual([e for e in events if e != "unset"], [])
+
+    def test_f_is_never_pressed_when_focus_is_not_on_the_player(self):
+        ran = []
+        with mock.patch.object(ryoku_link, "hyprctl", lambda *a: {"activewindow": {"address": "0xother"}}[a[0]]), \
+                mock.patch.object(ryoku_link, "FOCUS_TIMEOUT", 0.2), mock.patch.object(ryoku_link.time, "sleep", lambda s: None), \
+                mock.patch.object(ryoku_link.subprocess, "run", lambda argv, **kw: ran.append(argv)):
+            self.assertFalse(ryoku_link.enter_fullscreen(self.ADDRESS))
+        self.assertEqual(ran, [])
+
+    def test_the_dispatcher_names_the_window_and_only_takes_set_or_unset(self):
+        self.assertEqual(ryoku_link.fullscreen_dispatch("0xa1", "set"),
+                         'hl.dsp.window.fullscreen({ mode = "fullscreen", action = "set", window = "address:0xa1" })')
+        with self.assertRaises(ValueError):
+            ryoku_link.fullscreen_dispatch("0xa1", "toggle")
+
+
+class WpctlSink:
+    """A wpctl that keeps one sink's volume, as the real one does: a relative step is limited by `-l`."""
+    def __init__(self, level, muted=False):
+        self.level, self.muted, self.calls = level, muted, []
+
+    def run(self, argv, **kw):
+        self.calls.append((argv, kw))
+        if argv[:2] == ["wpctl", "get-volume"]:
+            return mock.Mock(returncode=0, stdout=f"Volume: {self.level / 100:.2f}{' [MUTED]' if self.muted else ''}\n", stderr="")
+        sign = 1 if argv[3].endswith("+") else -1
+        limit = float(argv[argv.index("-l") + 1]) * 100 if "-l" in argv else float("inf")
+        self.level = max(0, min(limit, self.level + sign * int(argv[3][:-2]))) if sign > 0 else max(0, self.level - int(argv[3][:-2]))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+
+class PcVolume(unittest.TestCase):
+    def change(self, sink, step):
+        with mock.patch.object(ryoku_link.subprocess, "run", sink.run):
+            return ryoku_link.change_volume(step)
+
+    def test_a_step_is_five_points_of_the_default_sink_capped_at_full_volume(self):
+        self.assertEqual(ryoku_link.volume_argv(1), ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%+", "-l", "1.0"])
+        self.assertEqual(ryoku_link.volume_argv(-1), ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-", "-l", "1.0"])
+        for bad in (0, 2, -2, 5, None, "1"):
+            with self.assertRaises(ValueError):
+                ryoku_link.volume_argv(bad)
+
+    def test_steps_move_the_level_and_never_pass_the_limits(self):
+        self.assertEqual(self.change(WpctlSink(35), 1), (40, False))
+        self.assertEqual(self.change(WpctlSink(35), -1), (30, False))
+        self.assertEqual(self.change(WpctlSink(98), 1), (100, False))
+        self.assertEqual(self.change(WpctlSink(100), 1), (100, False))
+        self.assertEqual(self.change(WpctlSink(2), -1), (0, False))
+
+    def test_a_muted_sink_says_so(self):
+        self.assertEqual(self.change(WpctlSink(35, muted=True), 1), (40, True))
+
+    def test_commands_are_argument_lists_run_without_a_shell(self):
+        sink = WpctlSink(35)
+        self.change(sink, 1)
+        self.assertEqual([argv[:2] for argv, _ in sink.calls], [["wpctl", "set-volume"], ["wpctl", "get-volume"]])
+        for argv, kw in sink.calls:
+            self.assertIsInstance(argv, list)
+            self.assertFalse(kw.get("shell", False))
+
+    def test_wpctl_output_is_read_strictly(self):
+        self.assertEqual(ryoku_link.parse_volume("Volume: 0.35\n"), (35, False))
+        self.assertEqual(ryoku_link.parse_volume("Volume: 1.00 [MUTED]\n"), (100, True))
+        for bad in ("", "Volume: loud", "Volume: 0.35 [MUTED] extra", "Failed to find"):
+            self.assertIsNone(ryoku_link.parse_volume(bad), bad)
+
+    def test_a_failing_wpctl_is_an_error_not_a_level(self):
+        failed = mock.Mock(returncode=1, stdout="", stderr="no such node")
+        with mock.patch.object(ryoku_link.subprocess, "run", lambda argv, **kw: failed):
+            with self.assertRaises(ryoku_link.VolumeError):
+                ryoku_link.change_volume(1)
+        with mock.patch.object(ryoku_link.subprocess, "run", mock.Mock(side_effect=FileNotFoundError(2, "No such file"))):
+            with self.assertRaises(ryoku_link.VolumeError):
+                ryoku_link.change_volume(1)
+
+    def command(self, msg, sink=None):
+        sent = []
+
+        async def fake_reply(writer, message):
+            sent.append(message)
+
+        async def go():
+            with mock.patch.object(ryoku_link, "reply", fake_reply), mock.patch.object(ryoku_link.subprocess, "run", (sink or WpctlSink(35)).run):
+                await ryoku_link.on_command(None, {"cmd": "volume", **msg})
+
+        asyncio.run(go())
+        return sent
+
+    def test_the_phone_is_answered_with_the_new_level(self):
+        self.assertEqual(self.command({"step": 1}), [{"type": "volume", "level": 40, "muted": False}])
+        self.assertEqual(self.command({"step": -1}), [{"type": "volume", "level": 30, "muted": False}])
+
+    def test_anything_but_a_step_of_one_is_refused_before_wpctl_runs(self):
+        for step in (0, 2, -5, True, 1.0, "1", None, [1]):
+            sink = WpctlSink(35)
+            self.assertEqual(self.command({"step": step}, sink), [{"type": "volume", "error": "not a volume step"}], step)
+            self.assertEqual(sink.calls, [], step)
+        self.assertEqual(self.command({})[0]["type"], "volume")
+
+    def test_a_failure_is_reported_to_the_phone(self):
+        failed = mock.Mock(returncode=1, stdout="", stderr="no such node")
+        sink = mock.Mock(run=lambda argv, **kw: failed)
+        sent = self.command({"step": 1}, sink)
+        self.assertEqual(sent[0]["type"], "volume")
+        self.assertIn("failed", sent[0]["error"])
 
 
 class FindingTheVideo(unittest.TestCase):

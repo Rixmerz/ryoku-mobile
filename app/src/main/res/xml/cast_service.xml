@@ -2,11 +2,14 @@
 <!-- Window changes tell the service which app is in front. Window content is read in one place, when the
      button is tapped: YouTube's share sheet, for the video's link (see CastService); view ids are needed to
      tell that sheet from the page under it.
+     Key events are filtered only to take the two volume buttons while a video sent to the PC is playing there
+     (PcSession); every other key, and these two outside that, go on to the phone untouched.
      No touch exploration and no gestures: those turn every single tap into explore-by-touch. -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds|flagRequestFilterKeyEvents"
     android:canRetrieveWindowContent="true"
+    android:canRequestFilterKeyEvents="true"
     android:notificationTimeout="100"
     android:description="@string/cast_service_description" />

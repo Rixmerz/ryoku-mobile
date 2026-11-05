@@ -15,6 +15,42 @@ video is paused so it does not play in two places.
 3. Open YouTube. A small **PC** button appears on the edge of the screen **only while YouTube is in front**;
    drag it to move it. Tap it.
 4. A line over the screen says what happened: `Opened on the PC, desktop N`, or why not.
+5. The video opens **fullscreen** on the PC and a **PC session** starts (see below).
+
+## Fullscreen
+
+The PC's player window is one reused browser window. Every send ends with the video filling the whole monitor,
+no browser chrome: once the page has loaded the bridge presses YouTube's `f` key in the focused player, and the
+browser then asks Hyprland to make the window fullscreen. If `f` has not taken after 1.5 s it is pressed once
+more, and if it still has not, Hyprland's own fullscreen is set as a fallback (that one keeps YouTube's page
+around the video).
+
+A re-send never types into a fullscreen page (with the player fullscreen, Ctrl+L does not reach the address bar and
+the address would be typed into the page as YouTube shortcuts). So every send first takes the window out of
+fullscreen (Hyprland's `unset` also ends the page's fullscreen), loads the video, then presses `f` once on the
+freshly loaded page. `f` is a toggle and is never pressed twice for one load unless the window still reads as not fullscreen.
+
+## PC volume (the phone's volume buttons)
+
+After a send succeeds, a **PC session** is active: the phone's **volume up / down buttons change the PC's volume**
+(5 points a step on the default audio sink, never above 100%) and the phone's own volume does not change. A small
+line over the screen shows `PC volume 40%`. The PC button reads **VOL** while the session runs.
+
+The session ends, and the buttons control the phone again, when:
+
+- you **long-press the VOL button** (a tap still sends the video again and keeps the session), or
+- **YouTube plays on the phone again**, or
+- the PC cannot be reached (cable out, bridge stopped or too old) or cannot change its volume: the buttons are never
+  swallowed by a PC that is not there, or
+- the accessibility service stops.
+
+Outside a session the volume buttons are untouched, and a ringing or in-call phone always keeps them (they silence
+the ringer). This needs the accessibility service's key-event filtering (`canRequestFilterKeyEvents`); it takes
+only the two volume keys, only during a session, and every other key goes on to the phone. After updating the app,
+check that the service is still on in **Settings > Accessibility**.
+
+The bridge side is `{"cmd": "volume", "step": 1 | -1}`, answered with `{"type": "volume", "level": 40, "muted": false}`;
+`volume` is in the state's `features`, so a phone can tell an older bridge.
 
 The PC needs `ryoku-link` running (USB cable or the paired Wi-Fi link) and a Hyprland desktop.
 

@@ -36,6 +36,10 @@ JSON, the same for any future transport:
                    the lookup alone, sent when the phone's video changes so a later open_video finds the id
                    cached; not answered.
 
+  phone -> server  {"cmd": "volume", "step": 1 | -1}
+                   change the PC's default sink by 5 percentage points, never above 100%; answered to that
+                   phone alone with {"type": "volume", "level": 40, "muted": false} or {"type": "volume", "error": "..."}
+
 State is pushed on every Hyprland event (window opened, workspace switched, ...), read from
 Hyprland's event socket, so the phone updates as the desktop changes.
 
@@ -48,7 +52,8 @@ disappears from the PC because the phone looks at it.
 Handing a video over. `open_url` opens a YouTube video the phone is playing in the PC's default browser, in a
 new window on the first workspace nothing uses, and switches the PC monitor there with the window focused. Only
 YouTube video links are accepted, and the address opened is built from the parsed video id and a whole number
-of seconds, never from the phone's text; the browser is started without a shell.
+of seconds, never from the phone's text; the browser is started without a shell. The player window is
+made fullscreen once the page has loaded (see "Fullscreen" below the handoff code).
 Requires Hyprland configured through its Lua API (`hl.dsp`, `hl.monitor`), wf-recorder and wtype.
 """
 
@@ -202,7 +207,7 @@ def snapshot() -> dict:
         "type": "state",
         # What this bridge understands beyond the base protocol: a phone that wants one it lacks says so
         # instead of waiting for an answer an older bridge never gives.
-        "features": ["open_url", "open_video"],
+        "features": ["open_url", "open_video", "volume"],
         "host": socket.gethostname(),
         "viewing": viewing,
         "workspaces": [
@@ -862,6 +867,8 @@ LINK_PATHS = ("shorts", "live", "embed")  # youtube.com/<one of these>/<id>
 BROWSER_WINDOW_TIMEOUT = 15.0
 PLAYER_FILE = os.path.join(SOCKET_DIR, "player.json")
 FOCUS_TIMEOUT = 2.0
+FULLSCREEN_TIMEOUT = 1.5  # how long a fullscreen request gets to show in Hyprland before it is judged to have failed
+PAGE_SETTLE = 1.5  # YouTube's player takes keys a moment after its page has been navigated to
 DESKTOP_FILE = re.compile(r"[A-Za-z0-9._-]+\.desktop")
 WINDOW_ADDRESS = re.compile(r"0x[0-9a-f]{1,16}")
 PLAYER_URL = re.compile(r"https://www\.youtube\.com/watch\?v=[A-Za-z0-9_-]{11}&t=\d{1,6}s")
@@ -1244,6 +1251,72 @@ def navigate_argv(url: str) -> list[list[str]]:
     return [["wtype", "-M", "ctrl", "-k", "l", "-m", "ctrl"], ["wtype", "--", url], ["wtype", "-k", "Return"]]
 
 
+# ---- Fullscreen ----
+#
+# The player window ends every send fullscreen, so the video fills the monitor from across the room. YouTube's
+# `f` key does that: the page's player goes fullscreen and the browser asks Hyprland to make its window
+# fullscreen too, with no browser chrome left. Hyprland's own fullscreen alone would keep the page's masthead
+# and sidebar, so it is only the fallback when `f` does not take.
+# A re-send must not type into a fullscreen page: with the player fullscreen, Ctrl+L never reaches the address
+# bar and the address is typed into the page as YouTube shortcuts. So every send first takes the window out of
+# fullscreen (Hyprland's `unset` also ends the page's fullscreen), navigates, and then presses `f` once on a
+# page that has just loaded and is therefore never fullscreen already. `f` toggles, so it is only repeated
+# while the window still reads as not fullscreen.
+
+FULLSCREEN_KEY = ["wtype", "-k", "f"]
+
+
+def fullscreen_dispatch(address: str, action: str) -> str:
+    """The Hyprland dispatcher that sets or unsets fullscreen on the window at `address`."""
+    if action not in ("set", "unset"):
+        raise ValueError(f"not a fullscreen action: {action!r}")
+    return f"hl.dsp.window.fullscreen({{ mode = \"fullscreen\", action = \"{action}\", window = {json.dumps('address:' + address)} }})"
+
+
+def fullscreen_state(address: str) -> int | None:
+    """Hyprland's fullscreen state of the window (a bit set, see is_fullscreen), None when it is gone."""
+    return next((c.get("fullscreen", 0) for c in hyprctl("clients") or [] if c["address"] == address), None)
+
+
+def is_fullscreen(state: int | None) -> bool:
+    """Hyprland's state is a bit set: 1 maximized, 2 fullscreen. A maximized window is not fullscreen: its address
+    bar answers Ctrl+L, so it is neither left nor counted as done."""
+    return state is not None and bool(state & 2)
+
+
+def leave_fullscreen(address: str) -> bool:
+    """Blocking: takes the window out of fullscreen. True once it does not read as fullscreen; nothing is
+    dispatched when it already does not."""
+    if not is_fullscreen(fullscreen_state(address)):
+        return True
+    dispatch(fullscreen_dispatch(address, "unset"))
+    return poll(lambda: not is_fullscreen(fullscreen_state(address)), FULLSCREEN_TIMEOUT, 0.1) is True
+
+
+def enter_fullscreen(address: str) -> bool:
+    """Blocking: makes the video fill the monitor. Presses `f` on the focused player; a second time only
+    when the window still reads as not fullscreen after the first got its time; Hyprland's fullscreen as the
+    last resort. True when the window is fullscreen at the end."""
+    time.sleep(PAGE_SETTLE)
+    for attempt in range(2):
+        if not focus_confirmed(address):
+            log(f"fullscreen: focus left player {address}, nothing pressed")
+            return False
+        if attempt and is_fullscreen(fullscreen_state(address)):  # the first press took, late
+            return True
+        done = subprocess.run(FULLSCREEN_KEY, capture_output=True, text=True, timeout=5)
+        if done.returncode != 0:
+            log(f"fullscreen: wtype failed: {done.stderr.strip()}")
+            break
+        if poll(lambda: is_fullscreen(fullscreen_state(address)), FULLSCREEN_TIMEOUT, 0.1):
+            return True
+    state = fullscreen_state(address)
+    if state is not None and not is_fullscreen(state):
+        log(f"fullscreen: the page did not take `f`, using Hyprland's fullscreen on {address}")
+        dispatch(fullscreen_dispatch(address, "set"))
+    return is_fullscreen(fullscreen_state(address))
+
+
 def show_player(url: str) -> int | None:
     """Blocking: shows the existing player window and loads `url` in it. The workspace, or None when
     there is no player to reuse (gone, or focus could not be confirmed): nothing was typed then."""
@@ -1259,6 +1332,8 @@ def show_player(url: str) -> int | None:
     if not focus_confirmed(address):
         log(f"handoff: focus did not reach player {address}")
         return None
+    if not leave_fullscreen(address):
+        raise HandoffError("the player window would not leave fullscreen")
     steps = navigate_argv(url)
     for i, argv in enumerate(steps):
         if i and not focus_confirmed(address):  # focus moved away mid-way: stop before typing elsewhere
@@ -1268,17 +1343,20 @@ def show_player(url: str) -> int | None:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=5)
         if done.returncode != 0:
             raise HandoffError(f"wtype failed: {done.stderr.strip()}")
-        time.sleep(0.15)
+        time.sleep(0.4 if i == 0 else 0.15)  # the address bar needs a moment to take focus: typed too soon, its first characters are lost
     return workspace
 
 
 def open_player(url: str) -> int:
     """Blocking: loads `url` in the one player window, making a new one (and remembering it) when
-    there is none. Always the user's own running browser and profile."""
+    there is none, and leaves it fullscreen. Always the user's own running browser and profile."""
     workspace = show_player(url)
-    if workspace is not None:
-        return workspace
-    return open_on_new_workspace(url, save_player)
+    if workspace is None:
+        workspace = open_on_new_workspace(url, save_player)
+    if address := load_player():
+        if not enter_fullscreen(address):
+            log(f"handoff: player {address} is not fullscreen")  # the video still opened: not a failed send
+    return workspace
 
 
 async def hand_over(writer: asyncio.StreamWriter, target: str) -> None:
@@ -1338,6 +1416,71 @@ async def handle_video(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         writer.close()
 
 
+# ---- PC volume from the phone ----
+#
+# While a video the phone sent is playing here, the phone's volume buttons step the default sink by 5 points.
+# wpctl's own limit keeps it from going above 100%; the level that is answered is read back from it. wpctl is
+# called directly (not `ryoku-volume`, which allows 150% with audio boost): the phone never exceeds 100%.
+
+VOLUME_SINK = "@DEFAULT_AUDIO_SINK@"
+VOLUME_STEP = 5
+VOLUME_READING = re.compile(r"Volume: (\d+(?:\.\d+)?)( \[MUTED\])?")
+
+
+class VolumeError(Exception):
+    pass
+
+
+def volume_argv(step: int) -> list[str]:
+    if step not in (1, -1):
+        raise ValueError(f"not a volume step: {step!r}")
+    return ["wpctl", "set-volume", VOLUME_SINK, f"{VOLUME_STEP}%{'+' if step > 0 else '-'}", "-l", "1.0"]
+
+
+def parse_volume(text: str) -> tuple[int, bool] | None:
+    """(level in percent, muted) from `wpctl get-volume` output such as `Volume: 0.35 [MUTED]`."""
+    m = VOLUME_READING.fullmatch(text.strip())
+    return (round(float(m.group(1)) * 100), m.group(2) is not None) if m else None
+
+
+def run_wpctl(argv: list[str]) -> str:
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise VolumeError(f"could not run {argv[0]} ({getattr(e, 'strerror', None) or e})") from e
+    if done.returncode != 0:
+        raise VolumeError(f"{argv[0]} failed: {done.stderr.strip()}")
+    return done.stdout
+
+
+def change_volume(step: int) -> tuple[int, bool]:
+    """Blocking: steps the default sink and returns the level it is at now, in percent, and whether it is muted."""
+    run_wpctl(volume_argv(step))
+    reading = parse_volume(run_wpctl(["wpctl", "get-volume", VOLUME_SINK]))
+    if reading is None:
+        raise VolumeError("could not read the volume back")
+    return reading
+
+
+volume_lock = asyncio.Lock()  # steps are read-modify-write: a held button must not interleave them
+
+
+async def set_volume(writer: asyncio.StreamWriter, msg: dict) -> None:
+    step = msg.get("step")
+    if not is_int(step) or step not in (1, -1):
+        log("volume refused: not a step of 1 or -1")
+        await reply(writer, {"type": "volume", "error": "not a volume step"})
+        return
+    async with volume_lock:
+        try:
+            level, muted = await asyncio.to_thread(change_volume, step)
+        except VolumeError as e:
+            log(f"volume failed: {e}")
+            await reply(writer, {"type": "volume", "error": str(e)})
+            return
+    await reply(writer, {"type": "volume", "level": level, "muted": muted})
+
+
 async def on_command(writer: asyncio.StreamWriter, msg: dict) -> None:
     cmd = msg.get("cmd")
     if cmd in ("view", "unview"):
@@ -1357,6 +1500,8 @@ async def on_command(writer: asyncio.StreamWriter, msg: dict) -> None:
         await open_url(writer, msg)
     elif cmd == "open_video":
         await open_video(writer, msg)
+    elif cmd == "volume":
+        await set_volume(writer, msg)
     elif cmd == "resolve_video":
         await asyncio.to_thread(warm_video, msg)
     elif view is not None and view.owner is writer:

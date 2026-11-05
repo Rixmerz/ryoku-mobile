@@ -44,13 +44,14 @@ object PcHandoff {
     fun sendPlaying(context: Context, tappedAt: Long) {
         val tell = messenger(context)
         val link = DesktopLink().also { it.start(context) } // dials while the session is read
+        var kept = false // a send that landed hands its link on to the PC session
         try {
             val controller = youtubeSession(context)
                 ?: return tell("Cannot see what YouTube is playing: allow notification access, or use Share > Send to PC")
             val now = nowPlaying(controller) // before the pause: a paused session no longer moves its position on
-            handOver(controller, link, tell, needsVideo = true, now.positionMs != null, tappedAt) { link.openVideo(now) }
+            kept = handOver(context, controller, link, tell, needsVideo = true, now.positionMs != null, tappedAt) { link.openVideo(now) }
         } finally {
-            link.stop()
+            if (!kept) link.stop()
         }
     }
 
@@ -85,38 +86,46 @@ object PcHandoff {
             val tell = messenger(app)
             val tappedAt = SystemClock.elapsedRealtime()
             val link = DesktopLink().also { it.start(app) }
+            var kept = false
             try {
                 val controller = youtubeSession(app)
                 val now = controller?.let(::nowPlaying)
-                handOver(controller, link, tell, needsVideo = false, now?.positionMs != null, tappedAt) { link.openUrl(url, now) }
+                kept = handOver(app, controller, link, tell, needsVideo = false, now?.positionMs != null, tappedAt) { link.openUrl(url, now) }
             } finally {
-                link.stop()
+                if (!kept) link.stop()
             }
         }
     }
 
     /**
      * Waits for the computer, runs [send], pauses the phone's video and tells the person the outcome. The video
-     * is started again when the computer did not take it. Nothing from an exception is ever shown.
+     * is started again when the computer did not take it. Nothing from an exception is ever shown. True when the
+     * computer took the video: [link] then belongs to the PC session (see PcSession), else the caller stops it.
      */
-    private fun handOver(controller: MediaController?, link: DesktopLink, tell: (String) -> Unit, needsVideo: Boolean, positionKnown: Boolean, tappedAt: Long, send: () -> Unit) {
-        if (!waitFor(8_000) { link.connected }) return tell("No computer found: plug the cable in")
+    private fun handOver(context: Context, controller: MediaController?, link: DesktopLink, tell: (String) -> Unit, needsVideo: Boolean, positionKnown: Boolean, tappedAt: Long, send: () -> Unit): Boolean {
+        if (!waitFor(8_000) { link.connected }) { tell("No computer found: plug the cable in"); return false }
         // A bridge from before this feature never answers; say so now instead of after a long wait.
-        if (!(if (needsVideo) link.canOpenVideo else link.canOpenUrl)) return tell("The PC bridge is out of date: restart ryoku-link on the computer")
+        if (!(if (needsVideo) link.canOpenVideo else link.canOpenUrl)) { tell("The PC bridge is out of date: restart ryoku-link on the computer"); return false }
         send()
         controller?.transportControls?.pause()
         if (!waitFor(25_000) { link.openUrlReply != null }) {
             controller?.transportControls?.play()
-            return tell("The computer did not answer")
+            tell("The computer did not answer")
+            return false
         }
-        val reply = link.openUrlReply ?: return
+        val reply = link.openUrlReply ?: return false
         Log.w(TAG, "tap to reply: ${SystemClock.elapsedRealtime() - tappedAt} ms, workspace=${reply.workspace}, error=${reply.error}")
-        if (reply.workspace == null) controller?.transportControls?.play()
+        if (reply.workspace == null) {
+            controller?.transportControls?.play()
+            tell("Could not send: ${reply.error}")
+            return false
+        }
+        PcSession.begin(context, controller, link)
         tell(when {
-            reply.workspace == null -> "Could not send: ${reply.error}"
             !positionKnown -> "Opened on the PC, desktop ${reply.workspace}, from the start: YouTube did not report the minute"
             else -> "Opened on the PC, desktop ${reply.workspace}"
-        })
+        } + ". Volume buttons now control the PC; long-press the button to end")
+        return true
     }
 
     private fun messenger(context: Context): (String) -> Unit =

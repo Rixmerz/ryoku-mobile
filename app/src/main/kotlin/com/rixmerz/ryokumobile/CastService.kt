@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
@@ -30,6 +31,10 @@ import kotlin.concurrent.thread
  * The button sits on the edge of the screen only while a sendable app (YouTube for now) is in front; it
  * is hidden on the home screen, in this app and in every other app. Tapping it hands the video to the
  * computer (see PcHandoff). Drag it to move it.
+ *
+ * After a send the phone's volume buttons turn the computer's volume until the session ends (see PcSession): the
+ * service asks for key events for that and consumes only the two volume keys, and only during a session. The
+ * button reads VOL meanwhile and a long-press on it ends the session.
  */
 class CastService : AccessibilityService() {
     private val ui = Handler(Looper.getMainLooper())
@@ -80,9 +85,24 @@ class CastService : AccessibilityService() {
 
     override fun onServiceConnected() {
         PcHandoff.say = ::say
+        PcSession.showLevel = { say(it, PcSession.LEVEL_MS) }
+        PcSession.onChange = { ui.post { labelBubble() } }
+    }
+
+    /** Every key reaches this service; only the volume buttons of a PC session are taken, the rest is not ours. */
+    override fun onKeyEvent(event: KeyEvent): Boolean {
+        val step = when (event.keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> 1
+            KeyEvent.KEYCODE_VOLUME_DOWN -> -1
+            else -> return false
+        }
+        return PcSession.volumeKey(step, down = event.action == KeyEvent.ACTION_DOWN)
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
+        PcSession.end(null)
+        PcSession.showLevel = null
+        PcSession.onChange = null
         PcHandoff.say = null
         removeBubble()
         removeNotice()
@@ -133,11 +153,11 @@ class CastService : AccessibilityService() {
         val density = resources.displayMetrics.density
         val size = (44 * density).toInt()
         val view = TextView(this).apply {
-            text = "PC"
+            text = bubbleText()
             textSize = 12f
             gravity = Gravity.CENTER
             setTextColor(t.ink.toArgb())
-            contentDescription = "Send this app to the PC"
+            contentDescription = bubbleDescription()
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(t.paper.toArgb())
@@ -161,6 +181,15 @@ class CastService : AccessibilityService() {
         params = lp
     }
 
+    private fun bubbleText() = if (PcSession.active) "VOL" else "PC"
+
+    private fun bubbleDescription() =
+        if (PcSession.active) "Send this app to the PC again. Long-press to end PC volume control" else "Send this app to the PC"
+
+    private fun labelBubble() {
+        (bubble as? TextView)?.apply { text = bubbleText(); contentDescription = bubbleDescription() }
+    }
+
     private fun removeBubble() {
         val view = bubble ?: return
         runCatching { getSystemService(WindowManager::class.java).removeView(view) }
@@ -171,20 +200,32 @@ class CastService : AccessibilityService() {
     /** A touch that stays within the slop is a tap and sends; anything further drags the button. */
     private fun dragOrTap(lp: WindowManager.LayoutParams): View.OnTouchListener {
         val slop = ViewConfiguration.get(this).scaledTouchSlop
-        var downX = 0f; var downY = 0f; var startX = 0; var startY = 0; var dragged = false
+        var downX = 0f; var downY = 0f; var startX = 0; var startY = 0; var dragged = false; var endedSession = false
+        // Held in place, the button ends the PC session; it then does not send when let go.
+        val endSession = Runnable {
+            if (PcSession.active) { endedSession = true; PcSession.end("PC volume off: volume buttons control the phone again") }
+        }
         return View.OnTouchListener { v, e ->
             when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { downX = e.rawX; downY = e.rawY; startX = lp.x; startY = lp.y; dragged = false }
+                MotionEvent.ACTION_DOWN -> {
+                    downX = e.rawX; downY = e.rawY; startX = lp.x; startY = lp.y; dragged = false; endedSession = false
+                    ui.postDelayed(endSession, ViewConfiguration.getLongPressTimeout().toLong())
+                }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = e.rawX - downX; val dy = e.rawY - downY
                     if (dragged || dx * dx + dy * dy > slop * slop) {
                         dragged = true
+                        ui.removeCallbacks(endSession)
                         lp.x = startX + dx.toInt(); lp.y = startY + dy.toInt()
                         savedX = lp.x; savedY = lp.y
                         getSystemService(WindowManager::class.java).updateViewLayout(v, lp)
                     }
                 }
-                MotionEvent.ACTION_UP -> if (!dragged) front?.let { sendToPc(it) }
+                MotionEvent.ACTION_UP -> {
+                    ui.removeCallbacks(endSession)
+                    if (!dragged && !endedSession) front?.let { sendToPc(it) }
+                }
+                MotionEvent.ACTION_CANCEL -> ui.removeCallbacks(endSession)
             }
             true
         }
@@ -215,7 +256,7 @@ class CastService : AccessibilityService() {
      * whose notifications are switched off (logcat: "Suppressing toast ... by user request"), and the
      * button then looks like it does nothing. An accessibility overlay needs no permission.
      */
-    private fun say(text: String) { ui.post {
+    private fun say(text: String, ms: Long = NOTICE_MS) { ui.post {
         removeNotice()
         val t = Tokens(signature)
         val density = resources.displayMetrics.density
@@ -242,7 +283,7 @@ class CastService : AccessibilityService() {
         }
         runCatching { getSystemService(WindowManager::class.java).addView(view, lp) }.onSuccess {
             notice = view
-            ui.postDelayed({ if (notice === view) removeNotice() }, NOTICE_MS)
+            ui.postDelayed({ if (notice === view) removeNotice() }, ms)
         }
     } }
 
