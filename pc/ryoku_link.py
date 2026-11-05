@@ -1076,14 +1076,25 @@ def resume_playback(serial: str, display: int, package: str, timeout: float = 12
     """Presses play until the app's media session says PLAYING; True once it does. Blocking.
     KEYCODE_MEDIA_PLAY (126), never PLAY_PAUSE, so an already playing video is not paused. It is only
     pressed for a session that is paused or stopped: with no session Android would hand the key to
-    whatever media app played last."""
+    whatever media app played last. YouTube pauses a moment after the move, often after a first
+    PLAYING reading, so it only counts once STEADY_READS readings in a row said PLAYING."""
+    playing_reads = [0]
+
     def settle() -> bool:
         state = playback_state(serial, package)
         if state in ("PAUSED", "STOPPED"):
+            playing_reads[0] = 0
             adb(serial, "shell", "input", "-d", str(display), "keyevent", "126")
-            state = poll(lambda: playback_state(serial, package) == "PLAYING" and "PLAYING", 2.0, 0.4)
-        return state == "PLAYING"
+            return False
+        if state != "PLAYING":
+            playing_reads[0] = 0
+            return False
+        playing_reads[0] += 1
+        return playing_reads[0] >= STEADY_READS
     return bool(poll(settle, timeout, interval=0.5))
+
+
+STEADY_READS = 8  # readings 0.5 s apart: PLAYING must hold about 4 s before autoplay trusts it
 
 
 def launch_cast(package: str) -> Cast:

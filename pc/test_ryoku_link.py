@@ -840,7 +840,8 @@ class CastHealth(unittest.TestCase):
 class ResumePlayback(unittest.TestCase):
     def resume(self, states):
         phone = FakePhone(states=states)
-        with mock.patch.object(ryoku_link, "adb", phone), mock.patch.object(ryoku_link.time, "sleep"):
+        with mock.patch.object(ryoku_link, "adb", phone), mock.patch.object(ryoku_link.time, "sleep"), \
+                mock.patch.object(ryoku_link, "STEADY_READS", 2):
             return ryoku_link.resume_playback("S", 3, YT, timeout=2.0), phone.calls
 
     def test_a_paused_video_gets_play_on_its_display_until_the_session_says_playing(self):
@@ -853,6 +854,11 @@ class ResumePlayback(unittest.TestCase):
         ok, calls = self.resume(["PLAYING"])
         self.assertTrue(ok)
         self.assertFalse([c for c in calls if "keyevent" in c])
+
+    def test_a_video_that_pauses_right_after_a_first_playing_reading_gets_play(self):
+        ok, calls = self.resume(["PLAYING", "PAUSED", "PLAYING"])
+        self.assertTrue(ok)
+        self.assertIn(("shell", "input", "-d", "3", "keyevent", "126"), calls)
 
     def test_no_session_means_no_key_press_and_no_claim_of_playing(self):
         phone = FakePhone()
