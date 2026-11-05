@@ -2,12 +2,12 @@ package com.rixmerz.ryokumobile
 
 import android.app.Activity
 import android.content.pm.ActivityInfo
+import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
 import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.TextureView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -139,21 +139,34 @@ private fun Pill(label: String, modifier: Modifier, onClick: () -> Unit) {
             .clickable(onClick = onClick).padding(horizontal = Geo.s3, vertical = Geo.s2))
 }
 
+/**
+ * A TextureView, not a SurfaceView: on the phone this was tested on, a SurfaceView opened a second
+ * time (after the screen went landscape, portrait and landscape again) stayed attached, visible
+ * and sized but never got its surface, so the stream had nowhere to decode and the view stayed black.
+ * A TextureView is drawn by the window's own renderer, which already shows the rest of the screen.
+ */
 @Composable
 private fun LiveSurface(info: LiveInfo) {
     AndroidView(factory = { context ->
-        SurfaceView(context).apply {
+        TextureView(context).apply {
             var stream: VideoStream? = null
-            holder.addCallback(object : SurfaceHolder.Callback {
-                override fun surfaceCreated(h: SurfaceHolder) {
-                    stream = VideoStream(info.port, info.width, info.height, h.surface).also { it.start() }
+            var surface: Surface? = null
+            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+                    val s = Surface(texture)
+                    surface = s
+                    stream = VideoStream(info.port, info.width, info.height, s).also { it.start() }
                 }
-                override fun surfaceChanged(h: SurfaceHolder, format: Int, width: Int, height: Int) {}
-                override fun surfaceDestroyed(h: SurfaceHolder) {
-                    stream?.stop()
+                override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {}
+                override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                    stream?.stop() // returns once the decoder is released, before the texture goes
                     stream = null
+                    surface?.release()
+                    surface = null
+                    return true
                 }
-            })
+                override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {}
+            }
         }
     }, modifier = Modifier.fillMaxSize())
 }

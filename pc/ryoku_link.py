@@ -600,7 +600,11 @@ class PhoneView:
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
         try:
+            first = True
             while chunk := await proc.stdout.read(65536):
+                if first:
+                    log(f"first video bytes ({len(chunk)})")
+                    first = False
                 writer.write(chunk)
                 await writer.drain()
             log(f"wf-recorder ended (exit {await proc.wait()})")
@@ -673,6 +677,7 @@ async def handle_video(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     if v.stream:
         v.stream.cancel()
     v.stream = asyncio.current_task()
+    log("video connected")
     try:
         await v.stream_to(writer)
     except (ConnectionError, OSError):
