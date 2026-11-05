@@ -852,6 +852,8 @@ CAST_SETUP_TIMEOUT = 25.0
 # What an installed Android package name looks like: dotted identifiers, never a shell string.
 PACKAGE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+")
 OWN_PACKAGE = "com.rixmerz.ryokumobile"
+# The only apps that may be cast for now; add a package here to allow another one.
+CASTABLE_PACKAGES = frozenset({"com.google.android.youtube"})
 KEEP_APPS_FLAG = "--no-vd-destroy-content"
 
 
@@ -1038,6 +1040,9 @@ cast_lock = asyncio.Lock()  # the new display is found by diffing, so one cast s
 
 
 async def start_cast(writer: asyncio.StreamWriter, package: str) -> None:
+    if package not in CASTABLE_PACKAGES:
+        await reply(writer, {"type": "cast", "package": package, "error": "only YouTube can be sent to the PC for now"})
+        return
     async with cast_lock:
         if package in casts:
             await reply(writer, {"type": "cast", "package": package, "error": f"already on the PC, workspace {casts[package].workspace}"})

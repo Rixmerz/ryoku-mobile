@@ -426,6 +426,38 @@ class CastPackage(unittest.TestCase):
             self.assertFalse(ryoku_link.valid_package(name), repr(name))
 
 
+class CastAllowlist(unittest.TestCase):
+    def run_cast(self, package):
+        sent, launched = [], []
+
+        async def fake_reply(writer, message):
+            sent.append(message)
+
+        async def go():
+            with mock.patch.object(ryoku_link, "reply", fake_reply), \
+                    mock.patch.object(ryoku_link, "launch_cast", lambda p: launched.append(p) or ryoku_link.Cast(p, 7, "0x1", 3, None)), \
+                    mock.patch.object(ryoku_link, "set_zoom", lambda z: None), \
+                    mock.patch.object(ryoku_link, "casts", {}):
+                await ryoku_link.start_cast(None, package)
+
+        asyncio.run(go())
+        return sent, launched
+
+    def test_only_youtube_is_allowed(self):
+        self.assertEqual(ryoku_link.CASTABLE_PACKAGES, {"com.google.android.youtube"})
+
+    def test_youtube_is_cast(self):
+        sent, launched = self.run_cast("com.google.android.youtube")
+        self.assertEqual(launched, ["com.google.android.youtube"])
+        self.assertEqual(sent[0]["workspace"], 7)
+
+    def test_other_apps_are_refused_without_launching(self):
+        for package in ("com.brave.browser", "com.android.chrome", "com.google.android.youtube.music"):
+            sent, launched = self.run_cast(package)
+            self.assertEqual(launched, [], package)
+            self.assertIn("only YouTube", sent[0]["error"])
+
+
 class CastWorkspace(unittest.TestCase):
     def test_first_unused_id_is_chosen(self):
         workspaces = [{"id": i, "windows": 1} for i in (1, 2, 3, 4, 5)]

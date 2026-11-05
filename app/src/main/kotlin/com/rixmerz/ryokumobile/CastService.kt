@@ -135,6 +135,7 @@ class CastService : AccessibilityService() {
     /** A link made for this one request: the app need not be open, and nothing stays connected between taps. */
     private fun sendToPc(pkg: String) {
         if (sending) return
+        if (pkg !in CASTABLE) return say("Only YouTube can be sent to the PC for now")
         sending = true
         say("Sending to the PC…")
         thread(name = "cast-to-pc") {
@@ -207,5 +208,9 @@ class CastService : AccessibilityService() {
         notice = null
     }
 
-    private companion object { const val NOTICE_MS = 5_000L }
+    private companion object {
+        const val NOTICE_MS = 5_000L
+        // Apps that may be sent for now; the bridge enforces the same list (CASTABLE_PACKAGES in pc/ryoku_link.py).
+        val CASTABLE = setOf("com.google.android.youtube")
+    }
 }
