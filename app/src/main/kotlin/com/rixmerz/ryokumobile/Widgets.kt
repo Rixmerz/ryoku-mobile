@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.graphics.Color
 import java.util.Calendar
@@ -124,7 +125,7 @@ fun ClockWidget(face: Face) {
  */
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-fun Planner(tasks: Tasks, link: DesktopLink) {
+fun Planner(tasks: Tasks, link: DesktopLink, onView: (Int) -> Unit) {
     val now = rememberCalendar()
     var selected by remember { mutableStateOf(Tasks.key(now)) }
     // The desktop page exists only while the computer is connected: no dead page to swipe into.
@@ -140,7 +141,7 @@ fun Planner(tasks: Tasks, link: DesktopLink) {
                         scope.launch { pager.animateScrollToPage(1) }
                     }
                     1 -> TaskList(tasks, selected, onBack = { scope.launch { pager.animateScrollToPage(0) } })
-                    else -> DesktopPage(link)
+                    else -> DesktopPage(link, onView)
                 }
             }
         }
@@ -346,10 +347,13 @@ fun BatteryGlyph(level: Int, charging: Boolean) {
 
 /**
  * The computer's Hyprland workspaces, live. The active one is a bone plate (emphasis is
- * inversion); tapping a workspace switches the desktop to it.
+ * inversion). Tapping a workspace opens it as a live view that leaves the computer's monitor
+ * alone; holding it switches the monitor itself. A workspace the monitor is showing cannot be
+ * viewed (Hyprland shows one workspace on one output), so it is marked PC and a tap does nothing.
  */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun DesktopPage(link: DesktopLink) {
+private fun DesktopPage(link: DesktopLink, onView: (Int) -> Unit) {
     Row(verticalAlignment = Alignment.Bottom, modifier = Modifier.testTag("desktop")) {
         Text("Desktop", color = T.ink, fontFamily = Type.display, fontSize = Type.fValue)
         Spacer(Modifier.width(Geo.s2))
@@ -357,7 +361,8 @@ private fun DesktopPage(link: DesktopLink) {
             maxLines = 1, modifier = Modifier.padding(bottom = 4.dp).weight(1f))
         Eyebrow("USB", T.inkFaint)
     }
-    Spacer(Modifier.height(Geo.s3))
+    Text("TAP · VIEW      HOLD · SWITCH PC", color = T.inkFaint, fontFamily = Type.mono, fontSize = Type.fTiny, letterSpacing = Type.trackLabel)
+    Spacer(Modifier.height(Geo.s2))
     androidx.compose.foundation.lazy.grid.LazyVerticalGrid(androidx.compose.foundation.lazy.grid.GridCells.Fixed(3),
         horizontalArrangement = Arrangement.spacedBy(Geo.s2), verticalArrangement = Arrangement.spacedBy(Geo.s2)) {
         items(link.workspaces.size, key = { link.workspaces[it].id }) { i ->
@@ -367,11 +372,12 @@ private fun DesktopPage(link: DesktopLink) {
             Column(Modifier.fillMaxWidth().height(72.dp).clip(RoundedCornerShape(Geo.radius))
                 .background(if (w.active) T.bone else Color.Transparent)
                 .border(Geo.border, if (w.active) T.bone else T.line, RoundedCornerShape(Geo.radius))
-                .clickable { link.switchTo(w.id) }.padding(Geo.s2).testTag("ws:${w.id}")) {
+                .combinedClickable(onClick = { if (!w.busy) onView(w.id) }, onLongClick = { link.switchTo(w.id) })
+                .padding(Geo.s2).testTag("ws:${w.id}")) {
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(w.name, color = ink, fontFamily = Type.display, fontSize = 20.sp, lineHeight = Type.fValue)
                     Spacer(Modifier.weight(1f))
-                    Text("${w.windows.size}", color = faint, fontFamily = Type.mono, fontSize = Type.fMicro)
+                    Text(if (w.busy) "PC · ${w.windows.size}" else "${w.windows.size}", color = faint, fontFamily = Type.mono, fontSize = Type.fMicro)
                 }
                 // Window classes, deduplicated: "kitty ×3" reads faster than three kitty lines.
                 val classes = w.windows.groupingBy { it.cls }.eachCount().entries.sortedByDescending { it.value }

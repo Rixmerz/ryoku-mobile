@@ -28,10 +28,10 @@ class WireFormat(unittest.TestCase):
 
 class OutputSize(unittest.TestCase):
     def test_tall_phone_is_scaled_to_max_side_with_even_sides(self):
-        self.assertEqual(ryoku_link.output_size(1080, 2400), (864, 1920))
+        self.assertEqual(ryoku_link.output_size(1080, 2400), (1920, 864))
 
     def test_small_screen_is_kept(self):
-        self.assertEqual(ryoku_link.output_size(720, 1280), (720, 1280))
+        self.assertEqual(ryoku_link.output_size(720, 1280), (1280, 720))
 
     def test_odd_sizes_become_even(self):
         w, h = ryoku_link.output_size(721, 1281)

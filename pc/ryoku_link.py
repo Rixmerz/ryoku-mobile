@@ -20,7 +20,8 @@ network. The control protocol is newline-delimited JSON, the same for any future
 State is pushed on every Hyprland event (window opened, workspace switched, ...), read from
 Hyprland's event socket, so the phone updates as the desktop changes.
 
-Live view. `view` creates a headless Hyprland output sized like the phone's screen, shows the
+Live view. `view` creates a landscape headless Hyprland output (the phone's aspect, or 1920x1080 where
+the desktop forces it, see PhoneView), shows the
 chosen workspace on it, and `VIDEO_PORT` then serves an H.264 Annex-B stream of that output
 alone (wf-recorder, one access unit per AUD NAL). The phone's input goes to a virtual pointer
 and a virtual keyboard bound to that output, so the physical monitor keeps its own workspace.
@@ -54,9 +55,11 @@ ADB = os.environ.get("RYOKU_ADB") or (
 # found and removed at startup.
 OUTPUT = "RYOKU-PHONE"
 FPS = 30
-# Encoding 2400-px-tall frames on the CPU at 30 fps is the latency bottleneck; the stream is
-# scaled to this long side and the phone stretches it, which is invisible at phone density.
+# Encoding big frames on the CPU at 30 fps is the latency bottleneck, so the stream's long side
+# is capped here. It is also the mode the desktop's `ryoku-monitor autoscale` forces on a new
+# output ("highrr" of a headless output is 1920x1080), see PhoneView.open.
 MAX_SIDE = 1920
+NATIVE = (1920, 1080)
 # After this many seconds without phone input the PC's cursor and focus are handed back.
 REST_AFTER = 2.0
 # x264 for a live view: no B-frames or lookahead (latency), one thread and one slice per frame
@@ -117,8 +120,10 @@ def is_int(v) -> bool:
 
 
 def output_size(width: int, height: int) -> tuple[int, int]:
-    """The phone's screen scaled to MAX_SIDE, with even sides because yuv420p needs them."""
-    k = min(1.0, MAX_SIDE / max(width, height))
+    """The phone's screen as a landscape output (the app rotates to match, desktops are wide),
+    scaled to MAX_SIDE, with even sides because yuv420p needs them."""
+    width, height = max(width, height), min(width, height)
+    k = min(1.0, MAX_SIDE / width)
     return max(2, round(width * k / 2) * 2), max(2, round(height * k / 2) * 2)
 
 
@@ -185,7 +190,13 @@ class PhoneView:
 
     def __init__(self, owner: asyncio.StreamWriter, width: int, height: int):
         self.owner = owner
-        self.width, self.height = output_size(width, height)
+        # `ryoku-monitor autoscale` (this desktop's hotplug hook) re-asserts each output's
+        # configured mode every 2 s for about 12 s after it appears, and for an output it has
+        # never seen that mode is the headless default, 1920x1080. Fighting it costs a ~13 s
+        # wait for the phone's own size, so where it exists the native mode is used and the
+        # phone letterboxes it; elsewhere the output takes the phone's aspect.
+        self.fought = shutil.which("ryoku-monitor") is not None
+        self.width, self.height = NATIVE if self.fought else output_size(width, height)
         self.pointer: VirtualPointer | None = None
         self.stream: asyncio.Task | None = None
         self.watcher: asyncio.Task | None = None
@@ -202,19 +213,23 @@ class PhoneView:
         subprocess.run(["hyprctl", "output", "create", "headless", OUTPUT], capture_output=True, timeout=3)
         try:
             spec = f'hl.monitor({{ output = "{OUTPUT}", mode = "{self.width}x{self.height}@{FPS}", position = "auto-right", scale = 1 }})'
-            # Hyprland ignores a monitor rule sent before it has registered the new output, and
-            # `ryoku-monitor autoscale` (run by the desktop on every hotplug) may apply its own
-            # rule for it. So the rule is re-sent until the size has held for two checks in a row.
+            # Hyprland ignores a monitor rule sent before it has registered the new output, so the
+            # rule is re-sent until the output reports the size. The encoder only starts once it
+            # has held for a while: a size change under a running encoder garbles the stream.
+            hold = 5 if self.fought else 15
             held = 0
-            for _ in range(30):
-                subprocess.run(["hyprctl", "eval", spec], capture_output=True, timeout=3)
-                time.sleep(0.2)
+            for _ in range(60):
                 m = self.phone_monitor()
-                held = held + 1 if m and (m["width"], m["height"]) == (self.width, self.height) else 0
-                if held == 2:
+                if m and (m["width"], m["height"]) == (self.width, self.height):
+                    held += 1
+                else:
+                    held = 0
+                    subprocess.run(["hyprctl", "eval", spec], capture_output=True, timeout=3)
+                if held == hold:
                     break
+                time.sleep(0.2)
             else:
-                raise RuntimeError(f"headless output never took the size {self.width}x{self.height}")
+                raise RuntimeError(f"headless output never held the size {self.width}x{self.height}")
             self.reclaim_strays()
             self.pointer = VirtualPointer(OUTPUT)
         except BaseException:

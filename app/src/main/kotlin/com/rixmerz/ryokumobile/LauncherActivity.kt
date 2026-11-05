@@ -143,7 +143,7 @@ class LauncherActivity : ComponentActivity() {
 }
 
 /** One page is on screen at a time; back always steps toward Home. */
-enum class Page { Home, Apps, Hub }
+enum class Page { Home, Apps, Hub, Live }
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -151,6 +151,7 @@ fun Launcher(apps: List<AppEntry>, prefs: LauncherPrefs, tweaks: SystemTweaks, t
     val context = LocalContext.current
     var page by remember { mutableStateOf(Page.Home) }
     var menuFor by remember { mutableStateOf<AppEntry?>(null) }
+    var liveWorkspace by remember { mutableIntStateOf(0) }
     LaunchedEffect(homeTick) { page = Page.Home; menuFor = null }
     BackHandler(page != Page.Home) { page = Page.Home }
     // Declared after the page handler so it wins: back closes the menu before leaving the page.
@@ -185,7 +186,7 @@ fun Launcher(apps: List<AppEntry>, prefs: LauncherPrefs, tweaks: SystemTweaks, t
                 ClockWidget(prefs.face)
                 if (prefs.calendar) {
                     Spacer(Modifier.height(Geo.s5))
-                    Planner(tasks, link)
+                    Planner(tasks, link, onView = { liveWorkspace = it; page = Page.Live })
                 }
             }
             Spacer(Modifier.weight(1f))
@@ -205,6 +206,10 @@ fun Launcher(apps: List<AppEntry>, prefs: LauncherPrefs, tweaks: SystemTweaks, t
         HubPage(prefs, tweaks, onClose = { page = Page.Home }, onDefaultLauncher = {
             context.startActivity(Intent(Settings.ACTION_HOME_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         })
+    }
+
+    AnimatedVisibility(page == Page.Live, enter = fadeIn(), exit = fadeOut()) {
+        LiveView(link, liveWorkspace, onClose = { page = Page.Home })
     }
 
     menuFor?.let { app ->
