@@ -849,7 +849,11 @@ VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 MAX_SECONDS = 360_000  # 100 hours: longer than any video or live stream, short enough to be no free-form number
 LINK_PATHS = ("shorts", "live", "embed")  # youtube.com/<one of these>/<id>
 BROWSER_WINDOW_TIMEOUT = 15.0
+PLAYER_FILE = os.path.join(SOCKET_DIR, "player.json")
+FOCUS_TIMEOUT = 2.0
 DESKTOP_FILE = re.compile(r"[A-Za-z0-9._-]+\.desktop")
+WINDOW_ADDRESS = re.compile(r"0x[0-9a-f]{1,16}")
+PLAYER_URL = re.compile(r"https://www\.youtube\.com/watch\?v=[A-Za-z0-9_-]{11}&t=\d{1,6}s")
 FIELD_CODES = frozenset({"%u", "%U", "%f", "%F"})
 
 
@@ -1028,9 +1032,9 @@ def poll(read, timeout: float, interval: float = 0.3):
         time.sleep(interval)
 
 
-def open_on_new_workspace(url: str) -> int:
+def open_on_new_workspace(url: str, on_window=None) -> int:
     """Blocking: opens `url` in a new browser window on a free workspace, shows it and returns the
-    workspace. HandoffError when the desktop or the browser would not."""
+    workspace. `on_window` gets the new window's address. HandoffError when the desktop or the browser would not."""
     monitors = hyprctl("monitors") or []
     monitor = pc_monitor(monitors)
     if monitor is None:
@@ -1051,9 +1055,78 @@ def open_on_new_workspace(url: str) -> int:
     if window is None:
         dispatch(focus_workspace(previous))
         raise HandoffError("the browser opened no new window")
+    if on_window:
+        on_window(window["address"])
     if not dispatch(*show_steps(window, workspace)):
         log(f"handoff: could not show {window['address']} on workspace {workspace}")
     return workspace
+
+
+def load_player() -> str | None:
+    """The address of the window that plays the phone's videos; kept in a file so a restart finds it."""
+    try:
+        with open(PLAYER_FILE, encoding="utf-8") as f:
+            address = json.load(f).get("address")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return address if isinstance(address, str) and WINDOW_ADDRESS.fullmatch(address) else None
+
+
+def save_player(address: str) -> None:
+    os.makedirs(os.path.dirname(PLAYER_FILE), mode=0o700, exist_ok=True)
+    tmp = PLAYER_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"address": address}, f)
+    os.replace(tmp, PLAYER_FILE)
+
+
+def focus_confirmed(address: str) -> bool:
+    """True once Hyprland reports `address` as the focused window."""
+    return poll(lambda: (hyprctl("activewindow") or {}).get("address") == address, FOCUS_TIMEOUT, 0.1) is True
+
+
+def navigate_argv(url: str) -> list[list[str]]:
+    """The wtype argument lists that replace the page of the focused browser window with `url`:
+    Ctrl+L, the address, Enter. Only a rebuilt watch address is accepted."""
+    if not PLAYER_URL.fullmatch(url):
+        raise ValueError("not a rebuilt watch address")
+    return [["wtype", "-M", "ctrl", "-k", "l", "-m", "ctrl"], ["wtype", "--", url], ["wtype", "-k", "Return"]]
+
+
+def show_player(url: str) -> int | None:
+    """Blocking: shows the existing player window and loads `url` in it. The workspace, or None when
+    there is no player to reuse (gone, or focus could not be confirmed): nothing was typed then."""
+    address = load_player()
+    window = next((c for c in hyprctl("clients") or [] if c["address"] == address), None) if address else None
+    if window is None:
+        return None
+    monitor = pc_monitor(hyprctl("monitors") or [])
+    if monitor is None:
+        return None
+    workspace = window["workspace"]["id"]
+    dispatch(focus_monitor(monitor["name"]), focus_workspace(workspace), focus_window(address))
+    if not focus_confirmed(address):
+        log(f"handoff: focus did not reach player {address}")
+        return None
+    steps = navigate_argv(url)
+    for i, argv in enumerate(steps):
+        if i and not focus_confirmed(address):  # focus moved away mid-way: stop before typing elsewhere
+            log(f"handoff: focus left player {address}")
+            return None
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        if done.returncode != 0:
+            raise HandoffError(f"wtype failed: {done.stderr.strip()}")
+        time.sleep(0.15)
+    return workspace
+
+
+def open_player(url: str) -> int:
+    """Blocking: loads `url` in the one player window, making a new one (and remembering it) when
+    there is none. Always the user's own running browser and profile."""
+    workspace = show_player(url)
+    if workspace is not None:
+        return workspace
+    return open_on_new_workspace(url, save_player)
 
 
 async def open_url(writer: asyncio.StreamWriter, msg: dict) -> None:
@@ -1064,7 +1137,7 @@ async def open_url(writer: asyncio.StreamWriter, msg: dict) -> None:
         return
     async with handoff_lock:
         try:
-            workspace = await asyncio.to_thread(open_on_new_workspace, target)
+            workspace = await asyncio.to_thread(open_player, target)
         except HandoffError as e:
             log(f"handoff failed: {e}")
             await reply(writer, {"type": "open_url", "error": str(e)})

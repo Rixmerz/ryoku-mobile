@@ -636,7 +636,7 @@ class OpenUrlCommand(unittest.TestCase):
 
         async def go():
             with mock.patch.object(ryoku_link, "reply", fake_reply), \
-                    mock.patch.object(ryoku_link, "open_on_new_workspace", lambda url: opened.append(url) or 4), \
+                    mock.patch.object(ryoku_link, "open_player", lambda url: opened.append(url) or 4), \
                     mock.patch.object(ryoku_link, "dispatch", lambda *lua: dispatched.append(lua) or True):
                 await ryoku_link.on_command(None, {"cmd": "open_url", **msg})
 
@@ -663,7 +663,7 @@ class OpenUrlCommand(unittest.TestCase):
 
         async def go():
             with mock.patch.object(ryoku_link, "reply", fake_reply), \
-                    mock.patch.object(ryoku_link, "open_on_new_workspace", mock.Mock(side_effect=ryoku_link.HandoffError("the browser opened no new window"))):
+                    mock.patch.object(ryoku_link, "open_player", mock.Mock(side_effect=ryoku_link.HandoffError("the browser opened no new window"))):
                 await ryoku_link.on_command(None, {"cmd": "open_url", "url": f"https://youtu.be/{VIDEO}"})
 
         asyncio.run(go())
@@ -689,6 +689,7 @@ class OpenUrlCommand(unittest.TestCase):
 
         async def go():
             with mock.patch.object(ryoku_link, "reply", mock.AsyncMock()), mock.patch.object(ryoku_link, "hyprctl", hypr), \
+                    mock.patch.object(ryoku_link, "PLAYER_FILE", os.path.join(tempfile.mkdtemp(), "player.json")), \
                     mock.patch.object(ryoku_link.subprocess, "run", run), \
                     mock.patch.object(ryoku_link, "read_desktop_file", lambda name: "[Desktop Entry]\nExec=firefox %u\n"), \
                     mock.patch.object(ryoku_link.shutil, "which", lambda name: None), \
@@ -703,6 +704,68 @@ class OpenUrlCommand(unittest.TestCase):
             for fragment in ("$(", "`", "rm -rf", "reboot", "pwned", "si="):
                 self.assertNotIn(fragment, text)
         self.assertTrue(batches)
+
+
+class PlayerWindow(unittest.TestCase):
+    URL = f"https://www.youtube.com/watch?v={VIDEO}&t=77s"
+
+    def setUp(self):
+        self.file = os.path.join(tempfile.mkdtemp(), "ryoku-link", "player.json")
+        patch = mock.patch.object(ryoku_link, "PLAYER_FILE", self.file)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_show(self, clients, active, saved="0xa1"):
+        if saved:
+            ryoku_link.save_player(saved)
+        ran, dispatched = [], []
+
+        def hypr(*args):
+            return {"clients": clients, "monitors": monitors(1), "activewindow": {"address": active}}[args[0]]
+
+        with mock.patch.object(ryoku_link, "hyprctl", hypr), \
+                mock.patch.object(ryoku_link, "dispatch", lambda *lua: dispatched.append(lua) or True), \
+                mock.patch.object(ryoku_link, "FOCUS_TIMEOUT", 0.2), mock.patch.object(ryoku_link.time, "sleep", lambda s: None), \
+                mock.patch.object(ryoku_link.subprocess, "run", lambda argv, **kw: ran.append(argv) or mock.Mock(returncode=0, stderr="")):
+            return ryoku_link.show_player(self.URL), ran, dispatched
+
+    def test_an_existing_player_is_focused_and_gets_the_address_typed(self):
+        result, ran, dispatched = self.run_show([{"address": "0xa1", "workspace": {"id": 3}}], "0xa1")
+        self.assertEqual(result, 3)
+        self.assertEqual(ran, [["wtype", "-M", "ctrl", "-k", "l", "-m", "ctrl"], ["wtype", "--", self.URL], ["wtype", "-k", "Return"]])
+        self.assertIn("workspace = 3", dispatched[0][1])
+        self.assertIn('"address:0xa1"', dispatched[0][2])
+
+    def test_a_missing_player_types_nothing(self):
+        result, ran, _ = self.run_show([{"address": "0xb2", "workspace": {"id": 1}}], "0xb2")
+        self.assertEqual((result, ran), (None, []))
+
+    def test_no_saved_player_types_nothing(self):
+        self.assertEqual(self.run_show([{"address": "0xa1", "workspace": {"id": 1}}], "0xa1", saved=None)[:2], (None, []))
+
+    def test_unconfirmed_focus_types_nothing(self):
+        result, ran, _ = self.run_show([{"address": "0xa1", "workspace": {"id": 3}}], "0xc0ffee")
+        self.assertEqual((result, ran), (None, []))
+
+    def test_player_falls_back_to_a_new_window_that_becomes_the_player(self):
+        with mock.patch.object(ryoku_link, "show_player", lambda url: None), \
+                mock.patch.object(ryoku_link, "open_on_new_workspace", lambda url, on_window: on_window("0xbeef") or 2):
+            self.assertEqual(ryoku_link.open_player(self.URL), 2)
+        self.assertEqual(ryoku_link.load_player(), "0xbeef")
+
+    def test_the_player_survives_a_restart_and_a_bad_file_is_ignored(self):
+        ryoku_link.save_player("0xabc")
+        self.assertEqual(ryoku_link.load_player(), "0xabc")
+        for bad in ("not json", '{"address": "$(id)"}', "[]"):
+            with open(self.file, "w") as f:
+                f.write(bad)
+            self.assertIsNone(ryoku_link.load_player(), bad)
+
+    def test_only_a_rebuilt_watch_address_can_be_typed(self):
+        self.assertEqual(ryoku_link.navigate_argv(self.URL)[1], ["wtype", "--", self.URL])
+        for bad in ("https://evil.com/watch?v=" + VIDEO + "&t=1s", self.URL + ";id", self.URL.replace("77s", "x"), "-k Return"):
+            with self.assertRaises(ValueError):
+                ryoku_link.navigate_argv(bad)
 
 
 if __name__ == "__main__":
