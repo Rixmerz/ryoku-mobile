@@ -25,8 +25,8 @@ data class DesktopWindow(val cls: String, val title: String)
 /** [busy]: a PC monitor is showing it, so the live view mirrors that monitor instead of moving the desktop (see PhoneView in ryoku_link.py). */
 data class Workspace(val id: Int, val name: String, val active: Boolean, val busy: Boolean, val windows: List<DesktopWindow>)
 
-/** The computer's answer to a cast: [workspace] when it opened, [error] when it did not. */
-data class CastReply(val pkg: String, val workspace: Int?, val error: String?)
+/** The computer's answer to [DesktopLink.openUrl]: the [workspace] the page opened on, or the [error] why it did not. */
+data class OpenUrlReply(val workspace: Int?, val error: String?)
 
 /** A live view the computer agreed to serve: the stream's size and the port its video is on. */
 data class LiveInfo(val workspace: Int, val width: Int, val height: Int, val port: Int)
@@ -51,10 +51,10 @@ class DesktopLink(private val port: Int = 7466) {
     var live by mutableStateOf<LiveInfo?>(null); private set
     /** True when the computer could not open the last view it was asked for. */
     var openFailed by mutableStateOf(false); private set
-    /** The computer's last answer to [cast]: the PC workspace it opened on, or why it could not. */
-    var castReply by mutableStateOf<CastReply?>(null); private set
-    /** False while connected to a bridge that predates `cast` (it would never answer one); set before [connected]. */
-    var castable by mutableStateOf(false); private set
+    /** The computer's last answer to [openUrl]. */
+    var openUrlReply by mutableStateOf<OpenUrlReply?>(null); private set
+    /** False while connected to a bridge that predates `open_url` (it would never answer one); set before [connected]. */
+    var canOpenUrl by mutableStateOf(false); private set
 
     private val io = Executors.newSingleThreadExecutor()
     private val sender = Executors.newSingleThreadExecutor()
@@ -73,7 +73,7 @@ class DesktopLink(private val port: Int = 7466) {
     fun stop() {
         running = false
         runCatching { socket?.close() }
-        // A link made for one request (see CastService) must not leave its two threads behind.
+        // A link made for one request (see PcHandoff) must not leave its two threads behind.
         io.shutdown()
         sender.shutdown()
     }
@@ -87,10 +87,16 @@ class DesktopLink(private val port: Int = 7466) {
         send(JSONObject().put("cmd", "view").put("id", id).put("width", width).put("height", height))
     }
 
-    /** Sends the app [pkg], running on this phone, to a new workspace of the computer; the answer lands in [castReply]. */
-    fun cast(pkg: String) {
-        castReply = null
-        send(JSONObject().put("cmd", "cast").put("package", pkg))
+    /**
+     * Asks the computer to open the video at [url] in its default browser, on a new workspace, at
+     * [positionSeconds] (null: whatever the link itself says). The computer validates both and builds the
+     * address it opens; the answer lands in [openUrlReply].
+     */
+    fun openUrl(url: String, positionSeconds: Long?) {
+        openUrlReply = null
+        val msg = JSONObject().put("cmd", "open_url").put("url", url)
+        if (positionSeconds != null) msg.put("position_seconds", positionSeconds)
+        send(msg)
     }
 
     fun closeView() {
@@ -222,7 +228,7 @@ class DesktopLink(private val port: Int = 7466) {
         when (o.optString("type")) {
             "state" -> parseState(o)
             "view" -> parseView(o)
-            "cast" -> castReply = CastReply(o.optString("package"), if (o.has("workspace")) o.getInt("workspace") else null, o.optString("error").ifEmpty { null })
+            "open_url" -> openUrlReply = OpenUrlReply(if (o.has("workspace")) o.getInt("workspace") else null, o.optString("error").ifEmpty { null })
         }
     }
 
@@ -243,7 +249,7 @@ class DesktopLink(private val port: Int = 7466) {
                 List(wins?.length() ?: 0) { j -> wins!!.getJSONObject(j).let { DesktopWindow(it.optString("class"), it.optString("title")) } })
         }
         host = o.optString("host")
-        castable = o.optJSONArray("features")?.let { f -> (0 until f.length()).any { f.optString(it) == "cast" } } ?: false
+        canOpenUrl = o.optJSONArray("features")?.let { f -> (0 until f.length()).any { f.optString(it) == "open_url" } } ?: false
         connected = true
     }
 }

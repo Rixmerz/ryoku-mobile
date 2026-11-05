@@ -22,10 +22,10 @@ JSON, the same for any future transport:
   phone -> server  {"cmd": "zoom", "factor": 1..8, "x": 0..1, "y": 0..1}
                    zoom the PC's screen about that point of the viewed output (factor 1 = off)
   phone -> server  {"cmd": "key", "text": "abc"} or {"cmd": "key", "key": "Return", "mods": ["ctrl"]}
-  phone -> server  {"cmd": "cast", "package": "com.google.android.youtube"}
-                   send the app in front on the phone to a new PC workspace (see "Casting");
-                   answered to that phone alone with {"type": "cast", "package": ..., "workspace": 7}
-                   or {"type": "cast", "package": ..., "error": "..."}
+  phone -> server  {"cmd": "open_url", "url": "https://youtu.be/<id>", "position_seconds": 77}
+                   open that YouTube video at that minute in the PC's default browser (see "Handing a
+                   video over"); answered to that phone alone with {"type": "open_url", "workspace": 7}
+                   or {"type": "open_url", "error": "..."}
 
 State is pushed on every Hyprland event (window opened, workspace switched, ...), read from
 Hyprland's event socket, so the phone updates as the desktop changes.
@@ -36,16 +36,14 @@ PC monitor is displaying is never moved: that monitor is mirrored instead. `VIDE
 H.264 Annex-B stream of whichever output the phone looks at (wf-recorder, one access unit per AUD
 NAL). The phone's input goes to a virtual pointer bound to that same output, so a workspace never
 disappears from the PC because the phone looks at it.
-Casting. `cast` moves a running phone app onto an Android virtual display that scrcpy mirrors in a window
-on the first PC workspace nothing uses; once the app is there, the PC monitor switches to that workspace
-and focuses the window, and closing the window sends it back to the workspace it was on. A cast first ends
-any live view and resets the screen zoom. The app keeps its state (`am display move-stack` moves the
-existing task; launching it on the display would start a second task instead). Needs scrcpy and adb on the PC.
+Handing a video over. `open_url` opens a YouTube video the phone is playing in the PC's default browser, in a
+new window on the first workspace nothing uses, and switches the PC monitor there with the window focused. Only
+YouTube video links are accepted, and the address opened is built from the parsed video id and a whole number
+of seconds, never from the phone's text; the browser is started without a shell.
 Requires Hyprland configured through its Lua API (`hl.dsp`, `hl.monitor`), wf-recorder and wtype.
 """
 
 import asyncio
-import hashlib
 import itertools
 import json
 import math
@@ -59,6 +57,7 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.parse
 
 PORT = int(os.environ.get("RYOKU_LINK_PORT", "7466"))
 VIDEO_PORT = int(os.environ.get("RYOKU_LINK_VIDEO_PORT", str(PORT + 1)))
@@ -70,9 +69,6 @@ ADB = os.environ.get("RYOKU_ADB") or (
     if os.path.exists(os.path.expanduser("~/Android/platform-tools/adb"))
     else shutil.which("adb") or "adb"
 )
-
-# scrcpy mirrors a phone app on the PC (see "Casting"); None while it is not installed.
-SCRCPY = os.environ.get("RYOKU_SCRCPY") or shutil.which("scrcpy")
 
 # The headless output the phone looks through. Fixed name: a stale one left by a crash is
 # found and removed at startup.
@@ -195,7 +191,7 @@ def snapshot() -> dict:
         "type": "state",
         # What this bridge understands beyond the base protocol: a phone that wants one it lacks says so
         # instead of waiting for an answer an older bridge never gives.
-        "features": ["cast"],
+        "features": ["open_url"],
         "host": socket.gethostname(),
         "viewing": viewing,
         "workspaces": [
@@ -833,156 +829,195 @@ async def end_view() -> None:
     await broadcast()
 
 
-# ---- Casting a phone app to the PC ----
+# ---- Handing a YouTube video over to the PC ----
 #
-# scrcpy creates an Android virtual display and mirrors it in a window; the app is then moved onto
-# that display with `am display move-stack`, which keeps its task and so what it was doing (a playing
-# video keeps playing). Starting the app on the display instead, as scrcpy's --start-app does, makes
-# a second task and loses that state. Audio: --audio-source=playback sends the apps' audio to the PC
-# (Android 13+); it stays off the phone's speaker, and apps that opt out of capture stay silent.
-# Closing the window ends the virtual display; --no-vd-destroy-content, when this scrcpy has it, makes
-# Android move the app back to the phone instead of closing it.
+# The phone sends the link of the video it is playing and the minute it is at; the bridge opens that
+# video in the PC's default browser, in a new window on a new empty workspace, and puts the PC there.
+# Nothing the phone sends is ever passed on as text: the link is parsed, its host and video id are
+# checked, and the address that is opened is built here from the id and a whole number of seconds
+# (watch_url). The browser is started from an argument list, never through a shell.
 #
-# The app has one task, so opening it on the phone during a cast (its icon, recents, its notification)
-# pulls that task back to the phone's display. With system decorations the virtual display then falls
-# back to the phone launcher's SecondaryDisplayLauncher, and the PC streamed the phone's home screen;
-# --no-vd-system-decorations leaves no launcher on the display, so it simply stays empty until the
-# watcher ends the cast. scrcpy's --start-app is no way around it: it moves that same task.
-#
-# The display is 1920x1080 at the phone's own density. At scrcpy's old 240 dpi it is 1280 dp wide, so
-# YouTube drew its tablet layout (a player pane beside a comments pane that spun forever); at the
-# phone's 400 dpi the smallest width stays phone-sized and the player fills the window like a phone
-# turned sideways.
+# The browser is the desktop's default (`xdg-settings get default-web-browser`): its .desktop file's Exec
+# line is run with --new-window added, which Chromium-based browsers and Firefox understand; a browser that
+# ignores it only opens a tab, and then no new window shows up and the handoff says so. Autoplay is the
+# browser's call: YouTube starts a watch page by itself, but a browser that blocks sound before the first
+# click on the site (Chromium's autoplay policy, for a profile that never played YouTube) leaves the
+# video paused on the PC until a click.
 
-CAST_SIZE = "1920x1080"
-CAST_SETUP_TIMEOUT = 25.0
-# What an installed Android package name looks like: dotted identifiers, never a shell string.
-PACKAGE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+")
-OWN_PACKAGE = "com.rixmerz.ryokumobile"
-# The only apps that may be cast for now; add a package here to allow another one.
-CASTABLE_PACKAGES = frozenset({"com.google.android.youtube"})
-KEEP_APPS_FLAG = "--no-vd-destroy-content"
-BARE_DISPLAY_FLAG = "--no-vd-system-decorations"  # no launcher on the virtual display (see above)
-GRIM = shutil.which("grim")  # screenshots of the cast window, to notice a frozen picture; None: not checked
-FROZEN_AFTER = 15.0  # seconds of an unchanged picture, while the video plays, before the cast is restarted
-MAX_RECOVERIES = 2  # restarts for one stuck picture before the bridge leaves the cast alone
+VIDEO_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"})
+VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+MAX_SECONDS = 360_000  # 100 hours: longer than any video or live stream, short enough to be no free-form number
+LINK_PATHS = ("shorts", "live", "embed")  # youtube.com/<one of these>/<id>
+BROWSER_WINDOW_TIMEOUT = 15.0
+DESKTOP_FILE = re.compile(r"[A-Za-z0-9._-]+\.desktop")
+FIELD_CODES = frozenset({"%u", "%U", "%f", "%F"})
 
 
-class CastError(Exception):
-    """A cast that could not start; the message is shown on the phone."""
+class HandoffError(Exception):
+    """A handoff that could not happen; the message is shown on the phone."""
 
 
-class Cast:
-    def __init__(self, package: str, workspace: int, address: str, display: int, previous: int | None = None,
-                 serial: str | None = None):
-        self.package, self.workspace, self.address, self.display = package, workspace, address, display
-        self.previous = previous  # the workspace the PC monitor showed before the cast; None: unknown
-        self.serial = serial  # the phone's adb serial, for the health checks
-        self.misses = 0  # consecutive failed health checks (see watch_casts)
-        self.recoveries = 0  # times a frozen picture made the bridge cast this app again
-        self.picture: str | None = None  # digest of what the window showed at the last frozen-picture check
-        self.picture_since = 0.0  # time.monotonic() from which the window has shown exactly that picture
+def parse_time(text: str) -> int | None:
+    """Seconds from a link's t= value: `77`, `77s` or `1h2m17s`; None when it is anything else."""
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?", text)
+    if not m or not any(m.groups()):
+        return None
+    hours, minutes, seconds = (int(g or 0) for g in m.groups())
+    total = hours * 3600 + minutes * 60 + seconds
+    return total if total <= MAX_SECONDS else None
 
 
-def valid_package(value) -> bool:
-    return isinstance(value, str) and len(value) <= 255 and value != OWN_PACKAGE and PACKAGE_PATTERN.fullmatch(value) is not None
+def parse_video_url(url) -> tuple[str, int | None] | None:
+    """(video id, seconds the link starts at or None) of a YouTube video link, None for anything else:
+    another host, another scheme, no video id or an id that is not 11 plain characters."""
+    if not isinstance(url, str) or len(url) > 2048:
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or host not in VIDEO_HOSTS or parts.username or parts.password or port not in (None, 80, 443):
+        return None
+    query = urllib.parse.parse_qs(parts.query)
+    path = [p for p in parts.path.split("/") if p]
+    if host == "youtu.be":
+        video_id = path[0] if len(path) == 1 else None
+    elif path == ["watch"]:
+        video_id = next(iter(query.get("v", [])), None)
+    elif len(path) == 2 and path[0] in LINK_PATHS:
+        video_id = path[1]
+    else:
+        video_id = None
+    if video_id is None or not VIDEO_ID.fullmatch(video_id):
+        return None
+    start = next(iter(query.get("t", []) or query.get("start", [])), None)
+    return video_id, parse_time(start) if start else None
+
+
+def watch_url(video_id: str, seconds: int) -> str:
+    """The address that is opened. Only a plain video id and whole seconds can get into it."""
+    if not VIDEO_ID.fullmatch(video_id) or not is_int(seconds) or not 0 <= seconds <= MAX_SECONDS:
+        raise ValueError("not a video id and a number of seconds")
+    return f"https://www.youtube.com/watch?v={video_id}&t={seconds}s"
+
+
+def handoff_target(msg: dict) -> str | None:
+    """The address to open for an `open_url` message, None when the message is not a YouTube video.
+    The minute is the phone's position_seconds; a phone that cannot read it leaves it out and the
+    link's own start time (or 0) is used."""
+    parsed = parse_video_url(msg.get("url"))
+    if parsed is None:
+        return None
+    video_id, from_link = parsed
+    seconds = msg.get("position_seconds")
+    if seconds is None:
+        seconds = from_link or 0
+    if not is_int(seconds) or not 0 <= seconds <= MAX_SECONDS:
+        return None
+    return watch_url(video_id, seconds)
+
+
+def browser_exec(desktop_text: str) -> list[str] | None:
+    """The Exec words of a .desktop file's main entry, None when it has none."""
+    in_entry = False
+    for line in desktop_text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            in_entry = line == "[Desktop Entry]"
+        elif in_entry and line.startswith("Exec="):
+            try:
+                return shlex.split(line[len("Exec="):])
+            except ValueError:
+                return None
+    return None
+
+
+def browser_argv(exec_words: list[str] | None, url: str) -> list[str]:
+    """The command that opens `url` in a new window of the browser whose Exec words are given.
+    Without Exec words, xdg-open: it opens a tab, which is better than nothing."""
+    if not exec_words:
+        return ["xdg-open", url]
+    argv, placed = [], False
+    for word in exec_words:
+        if word in FIELD_CODES:
+            if not placed:
+                argv += ["--new-window", url]
+                placed = True
+        elif not (len(word) == 2 and word[0] == "%"):  # %i, %c, %k: icon, name and path of the launcher
+            argv.append(word)
+    return argv if placed else argv + ["--new-window", url]
+
+
+def default_browser_desktop() -> str | None:
+    for command in (["xdg-settings", "get", "default-web-browser"], ["xdg-mime", "query", "default", "x-scheme-handler/https"]):
+        try:
+            name = subprocess.run(command, capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if DESKTOP_FILE.fullmatch(name):
+            return name
+    return None
+
+
+def read_desktop_file(name: str) -> str | None:
+    dirs = [os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")]
+    dirs += (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    for base in dirs:
+        try:
+            with open(os.path.join(base, "applications", name), encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            continue
+    return None
+
+
+def launch_browser(url: str) -> list[str]:
+    """Starts the default browser on `url` in a new window and returns the command used. Own systemd scope
+    when there is one: a browser started cold must not die with this service's restart."""
+    name = default_browser_desktop()
+    text = read_desktop_file(name) if name else None
+    argv = browser_argv(browser_exec(text) if text else None, url)
+    if shutil.which("systemd-run"):
+        argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", *argv]
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return argv
 
 
 def free_workspace(workspaces: list[dict], monitors: list[dict]) -> int:
     """The lowest workspace id that has no windows and is shown on no monitor (the headless phone
-    output included), so a cast never lands on something in use or on what the PC monitor shows."""
+    output included), so a handoff never lands on something in use or on what the PC monitor shows."""
     used = {w["id"] for w in workspaces if w.get("windows", 0) > 0}
     used |= {m["activeWorkspace"]["id"] for m in monitors}
     return next(i for i in itertools.count(1) if i not in used)
 
 
-def parse_stack_list(text: str) -> list[tuple[int, int, str]]:
-    """(root task id, display id, package) for every task in `am stack list`."""
-    found, root = [], None
-    for line in text.splitlines():
-        if m := re.match(r"RootTask id=(\d+) .*\bdisplayId=(\d+)", line):
-            root = (int(m[1]), int(m[2]))
-        elif root and (m := re.match(r"\s+taskId=\d+: ([^/\s]+)/", line)):
-            found.append((root[0], root[1], m[1]))
-    return found
-
-
-def find_root_task(stack_list: str, package: str, display: int = 0) -> int | None:
-    """The root task of `package` on `display`; `am stack list` puts the front-most first."""
-    return next((root for root, shown_on, pkg in parse_stack_list(stack_list) if pkg == package and shown_on == display), None)
-
-
-def parse_displays(dumpsys_display: str) -> dict[int, str]:
-    """Display id -> type (INTERNAL, VIRTUAL, OVERLAY, ...) from `dumpsys display`."""
-    return {int(m[1]): m[2] for m in re.finditer(r'mBaseDisplayInfo=DisplayInfo\{"[^"]*", displayId (\d+),.*?\btype (\w+),', dumpsys_display)}
-
-
-def new_display(before: dict[int, str], after: dict[int, str]) -> int | None:
-    """The display that appeared between two listings, preferring a virtual one."""
-    fresh = sorted(i for i in after if i not in before)
-    return next((i for i in fresh if after[i] == "VIRTUAL"), fresh[0] if fresh else None)
-
-
-def cast_title(package: str) -> str:
-    return f"ryoku-cast {package}"
-
-
-def phone_density(wm_density: str) -> int | None:
-    """The density the phone really uses, from `wm density`: an override wins over the physical one."""
-    found = dict(re.findall(r"(Physical|Override) density: (\d+)", wm_density))
-    value = found.get("Override") or found.get("Physical")
-    return int(value) if value else None
-
-
-def cast_display(density: int | None) -> str:
-    return f"{CAST_SIZE}/{density}" if density else CAST_SIZE  # no density: scrcpy picks one for the size
-
-
-def scrcpy_argv(scrcpy: str, serial: str, title: str, keep_apps: bool, display: str = CAST_SIZE,
-                bare: bool = False) -> list[str]:
-    argv = [scrcpy, "-s", serial, f"--new-display={display}", "--audio-source=playback", f"--window-title={title}"]
-    return argv + [KEEP_APPS_FLAG] * keep_apps + [BARE_DISPLAY_FLAG] * bare
-
-
-def exec_in_workspace(argv: list[str], workspace: int, log_path: str) -> str:
-    """Lua dispatcher that runs `argv` on `workspace` without switching to it: the window only
-    becomes the PC's focus once the app is on it (see show_cast). Hyprland runs the command through
-    a shell, so every word is quoted; its output goes to a log."""
-    command = f"env ADB={shlex.quote(ADB)} {shlex.join(argv)} >{shlex.quote(log_path)} 2>&1"
-    return f"hl.dsp.exec_cmd({json.dumps(command, ensure_ascii=False)}, {{ workspace = \"{int(workspace)} silent\" }})"
+def pc_monitor(monitors: list[dict]) -> dict | None:
+    """The focused PC monitor (the phone's headless output is not one), else the first."""
+    pc = [m for m in monitors if m["name"] != OUTPUT]
+    return next((m for m in pc if m.get("focused")), pc[0] if pc else None)
 
 
 def focus_window(address: str) -> str:
     return f"hl.dsp.focus({{ window = {json.dumps('address:' + address)} }})"
 
 
-def pc_workspace(monitors: list[dict]) -> int | None:
-    """The workspace the focused PC monitor shows (the phone's headless output is not a PC monitor)."""
-    pc = [m for m in monitors if m["name"] != OUTPUT]
-    focused = next((m for m in pc if m.get("focused")), pc[0] if pc else None)
-    return focused["activeWorkspace"]["id"] if focused else None
+def move_window(address: str, workspace: int) -> str:
+    return f"hl.dsp.window.move({{ workspace = {int(workspace)}, window = {json.dumps('address:' + address)} }})"
 
 
-def show_cast(cast: Cast) -> list[str]:
-    """Dispatchers that put the PC on the cast's workspace with its window focused."""
-    return [focus_workspace(cast.workspace), focus_window(cast.address)]
+def new_window(before: set[str], clients: list[dict]) -> dict | None:
+    """The first window that was not there before, for the browser's new window."""
+    return next((c for c in clients if c["address"] not in before and c.get("mapped", True)), None)
 
 
-def return_steps(cast: Cast, monitors: list[dict]) -> list[str]:
-    """Dispatchers that send the PC back to where it was before `cast`. None when the PC has moved on
-    by itself (no monitor shows the cast's now empty workspace any more): it is not pulled back."""
-    shown_on = next((m["name"] for m in monitors if m["activeWorkspace"]["id"] == cast.workspace), None)
-    if cast.previous is None or shown_on is None:
-        return []
-    return [focus_monitor(shown_on), focus_workspace(cast.previous)]
+def show_steps(window: dict, workspace: int) -> list[str]:
+    """Dispatchers that leave the PC on `workspace` with `window` there and focused."""
+    moved = [] if window["workspace"]["id"] == workspace else [move_window(window["address"], workspace)]
+    return [*moved, focus_workspace(workspace), focus_window(window["address"])]
 
 
-def adb(serial: str, *args: str, timeout: float = 8) -> str:
-    # `adb shell` joins its words into one remote shell line: callers pass validated names and integers only.
-    return subprocess.run([ADB, "-s", serial, *args], capture_output=True, text=True, timeout=timeout).stdout
-
-
-def poll(read, timeout: float, interval: float = 0.4):
+def poll(read, timeout: float, interval: float = 0.3):
     """The first truthy `read()` before the deadline, else None. Runs on a worker thread."""
     deadline = time.monotonic() + timeout
     while True:
@@ -993,337 +1028,56 @@ def poll(read, timeout: float, interval: float = 0.4):
         time.sleep(interval)
 
 
-def window_titled(title: str) -> dict | None:
-    return next((c for c in hyprctl("clients") or [] if c.get("title") == title), None)
+def open_on_new_workspace(url: str) -> int:
+    """Blocking: opens `url` in a new browser window on a free workspace, shows it and returns the
+    workspace. HandoffError when the desktop or the browser would not."""
+    monitors = hyprctl("monitors") or []
+    monitor = pc_monitor(monitors)
+    if monitor is None:
+        raise HandoffError("the computer has no screen to show it on")
+    previous = monitor["activeWorkspace"]["id"]
+    workspace = free_workspace(hyprctl("workspaces") or [], monitors)
+    before = {c["address"] for c in hyprctl("clients") or []}
+    # Windows open on the focused workspace: go to the empty one first, so the browser's lands there.
+    if not dispatch(focus_monitor(monitor["name"]), focus_workspace(workspace)):
+        raise HandoffError("the desktop would not switch to a new workspace")
+    try:
+        argv = launch_browser(url)
+        log(f"handoff: {shlex.join(argv)}")
+    except OSError as e:
+        dispatch(focus_workspace(previous))
+        raise HandoffError(f"could not start the browser ({e.strerror or e})")
+    window = poll(lambda: new_window(before, hyprctl("clients") or []), BROWSER_WINDOW_TIMEOUT)
+    if window is None:
+        dispatch(focus_workspace(previous))
+        raise HandoffError("the browser opened no new window")
+    if not dispatch(*show_steps(window, workspace)):
+        log(f"handoff: could not show {window['address']} on workspace {workspace}")
+    return workspace
 
 
-def window_at(address: str) -> dict | None:
-    return next((c for c in hyprctl("clients") or [] if c.get("address") == address), None)
-
-
-def top_package(stack_list: str, display: int) -> str | None:
-    """The package of the front-most task on `display` (`am stack list` puts it first), None when empty."""
-    return next((pkg for _, shown_on, pkg in parse_stack_list(stack_list) if shown_on == display), None)
-
-
-def parse_playback_state(media_session: str, package: str) -> str | None:
-    """The playback state name (PLAYING, PAUSED, ...) of `package`'s media session in
-    `dumpsys media_session`, None when it has no session or the session reports no state."""
-    current = None
-    for line in media_session.splitlines():
-        if m := re.match(r"\s*package=(\S+)", line):
-            current = m[1]
-        elif current == package and (m := re.match(r"\s*state=PlaybackState \{state=(\w+)\(", line)):
-            return m[1]
-    return None
-
-
-def playback_state(serial: str, package: str) -> str | None:
-    return parse_playback_state(adb(serial, "shell", "dumpsys", "media_session"), package)
-
-
-def cast_problem(cast: Cast) -> str | None:
-    """Why `cast` is no longer a working cast, None while it is. Blocking; adb failures propagate and
-    mean "could not tell", never "dead". A cast works while its window exists, its virtual display
-    exists and the app is the front-most task on that display: anything else on the display (the phone's
-    launcher, when the app was closed, finished or moved back) is what the PC window would show."""
-    if window_at(cast.address) is None:
-        return "its window is gone"
-    displays = adb(cast.serial, "shell", "dumpsys", "display")
-    if not displays.strip():
-        raise OSError("adb returned no display list")
-    if cast.display not in parse_displays(displays):
-        return "its virtual display is gone"
-    top = top_package(adb(cast.serial, "shell", "am", "stack", "list"), cast.display)
-    if top != cast.package:
-        return f"{top or 'nothing'} is in front on the virtual display, not the app"
-    return None
-
-
-def window_picture(cast: Cast) -> str | None:
-    """A digest of what the cast window shows on the PC right now, None when it cannot be seen: not on
-    the workspace a monitor displays (Hyprland draws nothing for it then) or no grim. Blocking."""
-    window = window_at(cast.address)
-    if window is None or not GRIM or window["workspace"]["id"] not in {m["activeWorkspace"]["id"] for m in hyprctl("monitors") or []}:
-        return None
-    (x, y), (w, h) = window["at"], window["size"]
-    shot = subprocess.run([GRIM, "-g", f"{x},{y} {w}x{h}", "-t", "ppm", "-"], capture_output=True, timeout=5)
-    return hashlib.md5(shot.stdout).hexdigest() if shot.returncode == 0 and shot.stdout else None
-
-
-def picture_frozen(cast: Cast) -> bool:
-    """True when the window has shown the very same picture for FROZEN_AFTER seconds while the app's
-    media session says it is playing: the audio goes on, the picture does not. Blocking.
-    ponytail: a video that really stands still for that long (a music track over one image) looks the same;
-    the watcher recasts at most MAX_RECOVERIES times for it, then leaves the cast alone."""
-    digest, now = window_picture(cast), time.monotonic()
-    if digest is None or digest != cast.picture:
-        cast.picture, cast.picture_since = digest, now  # hidden, or the picture moved: start counting again
-        if digest is not None:
-            cast.recoveries = 0
-        return False
-    return now - cast.picture_since >= FROZEN_AFTER and playback_state(cast.serial, cast.package) == "PLAYING"
-
-
-def close_cast_window(address: str) -> None:
-    """Ends scrcpy, and with it the virtual display, by signalling the process of the window at `address`.
-    Waits for the window to go; a scrcpy that ignores SIGTERM is killed."""
-    for sig, wait in ((signal.SIGTERM, 4.0), (signal.SIGKILL, 2.0)):
-        window = window_at(address)
-        if window is None:
+async def open_url(writer: asyncio.StreamWriter, msg: dict) -> None:
+    target = handoff_target(msg)
+    if target is None:
+        log("handoff refused: not a YouTube video link")
+        await reply(writer, {"type": "open_url", "error": "not a YouTube video link"})
+        return
+    async with handoff_lock:
+        try:
+            workspace = await asyncio.to_thread(open_on_new_workspace, target)
+        except HandoffError as e:
+            log(f"handoff failed: {e}")
+            await reply(writer, {"type": "open_url", "error": str(e)})
             return
-        if window.get("pid"):
-            try:
-                os.kill(window["pid"], sig)
-            except ProcessLookupError:
-                pass  # it exited between the lookup and the signal: the goal
-        poll(lambda: window_at(address) is None, wait, interval=0.2)
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"handoff failed: {e}")
+            await reply(writer, {"type": "open_url", "error": "could not reach the desktop"})
+            return
+    log(f"handoff: {target} on workspace {workspace}")
+    await reply(writer, {"type": "open_url", "workspace": workspace})
 
 
-def resume_playback(serial: str, display: int, package: str, timeout: float = 12.0) -> str:
-    """Presses play until the app's media session says PLAYING. Blocking. Returns "playing", "left"
-    (the app is no longer in front on `display`) or "not playing".
-    KEYCODE_MEDIA_PLAY (126), never PLAY_PAUSE, so an already playing video is not paused. It is only
-    pressed for a session that is paused or stopped: with no session Android would hand the key to
-    whatever media app played last. YouTube pauses a moment after the move, often after a first
-    PLAYING reading, so it only counts once STEADY_READS readings in a row said PLAYING.
-    The key reaches the media session wherever the app is: once the app has gone back to the phone,
-    pressing it would start the video on the phone, its sound still captured by the closing cast."""
-    playing_reads = [0]
-
-    def settle() -> str | None:
-        if top_package(adb(serial, "shell", "am", "stack", "list"), display) != package:
-            return "left"
-        state = playback_state(serial, package)
-        if state in ("PAUSED", "STOPPED"):
-            playing_reads[0] = 0
-            adb(serial, "shell", "input", "-d", str(display), "keyevent", "126")
-            return False
-        if state != "PLAYING":
-            playing_reads[0] = 0
-            return False
-        playing_reads[0] += 1
-        return "playing" if playing_reads[0] >= STEADY_READS else None
-    return poll(settle, timeout, interval=0.5) or "not playing"
-
-
-STEADY_READS = 8  # readings 0.5 s apart: PLAYING must hold about 4 s before autoplay trusts it
-
-
-def launch_cast(package: str) -> Cast:
-    """Blocking: opens the scrcpy window and moves the app onto its display."""
-    if not SCRCPY:
-        raise CastError("scrcpy is not installed on the computer")
-    help_text = subprocess.run([SCRCPY, "--help"], capture_output=True, text=True, timeout=5)
-    help_text = help_text.stdout + help_text.stderr
-    if "--new-display" not in help_text:
-        raise CastError("this scrcpy is too old: it has no virtual display")
-    # USB serials first: a TCP one (Wi-Fi) only works when adb was already connected over the network.
-    serials = sorted(reverse_targets(), key=lambda s: ":" in s or s.startswith("adb-"))
-    if not serials:
-        raise CastError("no phone on adb: plug the cable in, or adb connect over Wi-Fi")
-    serial = serials[0]
-    if not adb(serial, "shell", "pm", "path", package).startswith("package:"):
-        raise CastError("that app is not installed on the phone")
-    root = find_root_task(adb(serial, "shell", "am", "stack", "list"), package)
-    if root is None:
-        raise CastError("that app is not running on the phone")
-    before = parse_displays(adb(serial, "shell", "dumpsys", "display"))
-    pc_monitors = hyprctl("monitors") or []
-    previous = pc_workspace(pc_monitors)
-    workspace = free_workspace(hyprctl("workspaces") or [], pc_monitors)
-    title = cast_title(package)
-    # Whatever still wears this title is a leftover (a bridge restart forgets its casts): adopting its
-    # window would mistake it for the new one, and it keeps a dead virtual display open.
-    for leftover in [c for c in hyprctl("clients") or [] if c.get("title") == title]:
-        log(f"closing a leftover cast window ({leftover.get('address')})")
-        close_cast_window(leftover["address"])
-    log_path = os.path.join(SOCKET_DIR, f"cast-{package}.log")
-    display_spec = cast_display(phone_density(adb(serial, "shell", "wm", "density")))
-    argv = scrcpy_argv(SCRCPY, serial, title, KEEP_APPS_FLAG in help_text, display_spec, BARE_DISPLAY_FLAG in help_text)
-    if KEEP_APPS_FLAG not in help_text:
-        log(f"this scrcpy lacks {KEEP_APPS_FLAG}: closing the window will close {package} instead of returning it to the phone")
-    if BARE_DISPLAY_FLAG not in help_text:
-        log(f"this scrcpy lacks {BARE_DISPLAY_FLAG}: the phone launcher may show on the PC when {package} leaves the cast")
-    if not dispatch(exec_in_workspace(argv, workspace, log_path)):
-        raise CastError("the desktop refused to start scrcpy")
-    window = None
-    try:
-        display = poll(lambda: new_display(before, parse_displays(adb(serial, "shell", "dumpsys", "display"))), CAST_SETUP_TIMEOUT)
-        if display is None:
-            raise CastError("scrcpy did not create a virtual display")
-        adb(serial, "shell", "am", "display", "move-stack", str(root), str(display))
-        if find_root_task(adb(serial, "shell", "am", "stack", "list"), package, display) is None:
-            raise CastError("Android would not move the app to the virtual display")
-        window = poll(lambda: window_titled(title), CAST_SETUP_TIMEOUT)
-        if window is None:
-            raise CastError("scrcpy opened no window")
-    except CastError:
-        try:
-            with open(log_path) as f:
-                log(f"scrcpy output: {f.read()[-400:].strip()}")
-        except OSError:
-            pass  # no log: scrcpy never started, the error above says why
-        if (w := window_titled(title)) and w.get("pid"):
-            os.kill(w["pid"], signal.SIGTERM)  # tears the virtual display down with it
-        raise
-    cast = Cast(package, window["workspace"]["id"], window["address"], display, previous, serial)
-    if not dispatch(*show_cast(cast)):
-        log(f"cast {package}: could not switch the PC to workspace {cast.workspace}")
-    return cast
-
-
-casts: dict[str, Cast] = {}
-cast_lock = asyncio.Lock()  # the new display is found by diffing, so one cast starts at a time
-CAST_POLL = 2.0  # seconds between health checks of the live casts
-CAST_MISSES = 2  # consecutive failed checks before a cast is ended: a task switch passes through odd states
-
-
-async def return_pc(ended: list[Cast]) -> None:
-    """Sends the PC back to where it was before the cast (once: it cannot return to two places) and
-    resets the screen zoom, which would otherwise be left on whatever the PC shows next."""
-    monitors = await asyncio.to_thread(hyprctl, "monitors") or []
-    for cast in ended:
-        if steps := return_steps(cast, monitors):
-            await asyncio.to_thread(dispatch, *steps)
-            break
-    await asyncio.to_thread(set_zoom, 1.0)
-
-
-async def end_cast(cast: Cast, reason: str, return_to_previous: bool = True) -> None:
-    """Ends a cast: closes its window (which tears the virtual display down), forgets it and returns the PC.
-    The caller holds cast_lock."""
-    if casts.get(cast.package) is cast:
-        del casts[cast.package]
-    log(f"cast {cast.package} ended: {reason}")
-    await asyncio.to_thread(close_cast_window, cast.address)
-    if return_to_previous:
-        await return_pc([cast])
-
-
-async def recast(cast: Cast) -> None:
-    """Restarts a cast whose picture froze: a new scrcpy (a new video stream and virtual display) with
-    the same app, shown where the old one was. The PC is not sent back in between, and it goes back to
-    where it was before the first cast. The caller holds cast_lock."""
-    await end_cast(cast, "the picture froze while the video played; casting it again", return_to_previous=False)
-    for attempt in range(3):  # the app takes a moment to come back to the phone's own display
-        try:
-            fresh = await asyncio.to_thread(launch_cast, cast.package)
-            break
-        except (CastError, OSError, subprocess.SubprocessError) as e:
-            log(f"cast {cast.package}: restart attempt {attempt + 1} failed: {e}")
-            await asyncio.sleep(2)
-    else:
-        await return_pc([cast])
-        return
-    fresh.previous, fresh.recoveries = cast.previous, cast.recoveries + 1
-    casts[cast.package] = fresh
-    log(f"cast {cast.package}: restarted on virtual display {fresh.display}, PC workspace {fresh.workspace}")
-    await asyncio.to_thread(autoplay, fresh)
-
-
-async def start_cast(writer: asyncio.StreamWriter, package: str) -> None:
-    if package not in CASTABLE_PACKAGES:
-        await reply(writer, {"type": "cast", "package": package, "error": "only YouTube can be sent to the PC for now"})
-        return
-    cast = None
-    async with cast_lock:
-        if existing := casts.get(package):
-            # A cast the bridge still remembers is reused when it works and cleaned up when it does not:
-            # a dead one must never answer "already busy" to the next Send to PC.
-            try:
-                problem = await asyncio.to_thread(cast_problem, existing)
-            except (OSError, ValueError, subprocess.SubprocessError) as e:
-                problem = f"the phone could not be reached ({e})"
-            if problem is None:
-                window = await asyncio.to_thread(window_at, existing.address)
-                if window:
-                    existing.workspace = window["workspace"]["id"]
-                await asyncio.to_thread(dispatch, *show_cast(existing))
-                log(f"cast {package}: already live on workspace {existing.workspace}, focused it")
-                await reply(writer, {"type": "cast", "package": package, "workspace": existing.workspace})
-                cast = existing
-            else:
-                await end_cast(existing, problem)
-        if cast is None:
-            cast = await launch_new_cast(writer, package)
-    # Outside the lock: pressing play takes seconds, and the watcher must be free meanwhile to notice
-    # the app leaving the display (opened again on the phone) and end the cast.
-    if cast is not None:
-        await asyncio.to_thread(autoplay, cast)
-
-
-async def launch_new_cast(writer: asyncio.StreamWriter, package: str) -> Cast | None:
-    """Opens a new cast of `package` and answers the phone; None when it failed. The caller holds cast_lock."""
-    # The phone is leaving for the app: a live view (its headless output, a pulled workspace, a
-    # screen zoom) must not be left on the PC next to the cast, nor shift which workspace is free.
-    if view is not None:
-        await end_view()
-    await asyncio.to_thread(set_zoom, 1.0)
-    try:
-        cast = await asyncio.to_thread(launch_cast, package)
-    except (CastError, OSError, subprocess.SubprocessError) as e:
-        log(f"cast of {package} failed: {e}")
-        await reply(writer, {"type": "cast", "package": package, "error": str(e) if isinstance(e, CastError) else "could not reach adb"})
-        return None
-    casts[package] = cast
-    log(f"cast {package}: virtual display {cast.display}, PC workspace {cast.workspace}")
-    await reply(writer, {"type": "cast", "package": package, "workspace": cast.workspace})
-    return cast
-
-
-def autoplay(cast: Cast) -> None:
-    """Moving the task pauses the video: resume it and say whether it is playing. Blocking."""
-    try:
-        outcome = resume_playback(cast.serial, cast.display, cast.package)
-    except (OSError, subprocess.SubprocessError) as e:
-        log(f"cast {cast.package}: could not resume playback ({e})")
-        return
-    said = {"playing": "playing", "left": "left the virtual display before it played; play is not pressed"}
-    log(f"cast {cast.package}: {said.get(outcome, 'not playing (paused, or no playback to resume)')}")
-
-
-async def reap_casts() -> None:
-    """Forgets casts whose window is gone: closing it ends scrcpy and with it the virtual display."""
-    if not casts:
-        return
-    open_windows = {c["address"] for c in await asyncio.to_thread(hyprctl, "clients") or []}
-    ended = [cast for cast in casts.values() if cast.address not in open_windows]
-    for cast in ended:
-        del casts[cast.package]
-        log(f"cast {cast.package} ended: its window was closed")
-    if ended:
-        await return_pc(ended)
-
-
-async def watch_casts() -> None:
-    """Ends a cast that stopped working, so the PC never keeps showing the phone's launcher and the
-    next Send to PC is never refused by a cast nobody uses. Needs CAST_MISSES bad checks in a row."""
-    while True:
-        await asyncio.sleep(CAST_POLL)
-        for cast in list(casts.values()):
-            async with cast_lock:
-                if casts.get(cast.package) is not cast:
-                    continue
-                try:
-                    problem, frozen = await asyncio.to_thread(check_cast, cast)
-                except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
-                    log(f"cast {cast.package}: health check failed ({e})")
-                    continue  # could not tell: the cast stays until adb answers
-                cast.misses = cast.misses + 1 if problem else 0
-                if problem and cast.misses >= CAST_MISSES:
-                    await end_cast(cast, problem)
-                elif frozen and cast.recoveries < MAX_RECOVERIES:
-                    await recast(cast)
-                elif frozen:
-                    cast.picture_since = time.monotonic()  # said once per window of FROZEN_AFTER
-                    log(f"cast {cast.package}: the picture looks frozen but was restarted {cast.recoveries} times already; leaving it")
-
-
-def check_cast(cast: Cast) -> tuple[str | None, bool]:
-    """(why the cast is dead or None, whether its picture is frozen). Blocking."""
-    problem = cast_problem(cast)
-    return problem, problem is None and picture_frozen(cast)
+handoff_lock = asyncio.Lock()  # the new window is found by diffing, so one handoff runs at a time
 
 
 async def handle_video(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -1358,11 +1112,8 @@ async def on_command(writer: asyncio.StreamWriter, msg: dict) -> None:
     elif cmd == "unview":
         if view is not None and view.owner is writer:
             await end_view()
-    elif cmd == "cast":
-        if valid_package(msg.get("package")):
-            await start_cast(writer, msg["package"])
-        else:
-            await reply(writer, {"type": "cast", "error": "not a package name"})
+    elif cmd == "open_url":
+        await open_url(writer, msg)
     elif view is not None and view.owner is writer:
         if cmd == "pointer":
             view.pointer_event(msg)
@@ -1412,7 +1163,6 @@ async def watch_hyprland() -> None:
                 await asyncio.sleep(0.05)
                 await broadcast()
                 follow_pc_soon()
-                await reap_casts()
         except (OSError, ConnectionError) as e:
             log(f"Hyprland event socket unavailable ({e}); retrying")
             await asyncio.sleep(3)
@@ -1483,16 +1233,10 @@ async def main() -> None:
         log(f"removing stale output {OUTPUT} from a previous run")
         subprocess.run(["hyprctl", "output", "remove", OUTPUT], capture_output=True, timeout=3)
     set_zoom(1.0)  # a zoom left by a run that died while the phone was pinching
-    # A cast window outlives a restart of this bridge, which no longer tracks it: left open it ends up
-    # showing the phone's launcher and blocks the next cast.
-    for client in hyprctl("clients") or []:
-        if client.get("title", "").startswith(cast_title("")):
-            log(f"closing cast window left by a previous run: {client['title']}")
-            close_cast_window(client["address"])
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, stop.set)
-    work = asyncio.gather(server.serve_forever(), video.serve_forever(), watch_hyprland(), keep_reverse(), watch_casts())
+    work = asyncio.gather(server.serve_forever(), video.serve_forever(), watch_hyprland(), keep_reverse())
     waiter = asyncio.ensure_future(stop.wait())
     try:
         done, _ = await asyncio.wait({work, waiter}, return_when=asyncio.FIRST_COMPLETED)

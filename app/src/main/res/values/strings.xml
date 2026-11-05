@@ -1,4 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="cast_service_description">Shows a small Send to PC button over other apps. Tap it to move the app you are using onto a new desktop of your computer. It only learns which app is in front.</string>
+    <string name="cast_service_description">Shows a small Send to PC button over other apps. Tap it to open the YouTube video you are watching on your computer, at the same minute. It learns which app is in front and, when you tap the button, reads the video link from the YouTube share sheet.</string>
 </resources>

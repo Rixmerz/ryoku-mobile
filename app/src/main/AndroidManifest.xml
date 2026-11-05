@@ -75,6 +75,21 @@
                 android:resource="@xml/cast_service" />
         </service>
 
+        <!-- "Send to PC" in every app's share sheet: YouTube's Share -> Send to PC delivers the video link. -->
+        <activity
+            android:name=".SendToPcActivity"
+            android:exported="true"
+            android:label="Send to PC"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
         <!-- Shizuku hands its binder to the app through this provider. -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"

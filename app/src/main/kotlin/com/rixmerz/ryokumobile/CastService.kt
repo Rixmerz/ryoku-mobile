@@ -3,16 +3,17 @@ package com.rixmerz.ryokumobile
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
-import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.TextView
 import androidx.compose.ui.graphics.toArgb
@@ -26,8 +27,8 @@ import kotlin.concurrent.thread
  * explore-by-touch for the whole phone.
  *
  * The button sits on the edge of the screen only while a sendable app (YouTube for now) is in front; it
- * is hidden on the home screen, in this app and in every other app. Tapping it asks the computer
- * (pc/ryoku_link.py) to take the app in front. Drag it to move it.
+ * is hidden on the home screen, in this app and in every other app. Tapping it hands the video to the
+ * computer (see PcHandoff). Drag it to move it.
  */
 class CastService : AccessibilityService() {
     private val ui = Handler(Looper.getMainLooper())
@@ -42,11 +43,11 @@ class CastService : AccessibilityService() {
     private var savedY = -1
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        // A task coming back from the computer's virtual display (a cast that ended) resumes on the
-        // phone without a window-state change: only the window list changes. Re-read what is in front.
+        // Coming back to an app (the share sheet closed, BACK to the home screen) does not always raise a
+        // window-state change: only the window list changes. Re-read what is in front.
         if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
             val pkg = phoneFrontApp() ?: return
-            front = if (pkg in CASTABLE) pkg else if (pkg == packageName) front else null
+            front = if (pkg in CASTABLE) pkg else null
             refreshBubble()
             return
         }
@@ -56,9 +57,6 @@ class CastService : AccessibilityService() {
             // The button's own overlay windows report themselves as this package too (a plain view class,
             // never an activity): they must not hide the button.
             pkg == packageName && event.className?.startsWith("android.") == true -> return
-            // A cast app shown on the computer's virtual display reports its windows here as well; it is
-            // not what the phone's screen shows, so it must not bring the button up over the home screen.
-            !onPhoneScreen(event) -> return
             // Only a sendable app in front shows the button. The home screen, this app and every other
             // app with a launcher entry hide it.
             pkg in CASTABLE -> front = pkg
@@ -71,27 +69,20 @@ class CastService : AccessibilityService() {
         refreshBubble()
     }
 
-    /** The package of the active application window on the phone's own screen, or null when unknown. */
+    /** The package of the active application window, or null when unknown. */
     private fun phoneFrontApp(): String? {
-        val windows = windowsOnAllDisplays.get(Display.DEFAULT_DISPLAY) ?: return null
-        val app = windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isActive }
-            ?: windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
-            ?: return null
-        return app.root?.packageName?.toString()
-    }
-
-    /** False when the event's window is on another display than the phone's own (a virtual display). */
-    private fun onPhoneScreen(event: AccessibilityEvent): Boolean {
-        val displays = windowsOnAllDisplays
-        for (i in 0 until displays.size()) {
-            if (displays.valueAt(i).any { it.id == event.windowId }) return displays.keyAt(i) == Display.DEFAULT_DISPLAY
-        }
-        return true // window already gone: assume the phone's screen, as the service always did
+        val apps = windows.filter { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
+        return (apps.firstOrNull { it.isActive } ?: apps.firstOrNull())?.root?.packageName?.toString()
     }
 
     override fun onInterrupt() = Unit
 
+    override fun onServiceConnected() {
+        PcHandoff.say = ::say
+    }
+
     override fun onUnbind(intent: Intent?): Boolean {
+        PcHandoff.say = null
         removeBubble()
         removeNotice()
         return super.onUnbind(intent)
@@ -167,39 +158,85 @@ class CastService : AccessibilityService() {
         }
     }
 
-    /** A link made for this one request: the app need not be open, and nothing stays connected between taps. */
+    /**
+     * The button: pause the video and note its minute, read the video's link off YouTube's own share
+     * sheet, and hand both to the computer. Nothing stays connected between taps.
+     */
     private fun sendToPc(pkg: String) {
         if (sending) return
         if (pkg !in CASTABLE) return say("Only YouTube can be sent to the PC for now")
         sending = true
         say("Sending to the PC…")
-        thread(name = "cast-to-pc") {
-            val link = DesktopLink()
+        thread(name = "send-to-pc") {
             try {
-                link.start(applicationContext)
-                if (!waitFor(8_000) { link.connected }) return@thread say("No computer found: plug the cable in")
-                // A bridge from before casting never answers `cast`; say so now instead of after 35 s of silence.
-                if (!link.castable) return@thread say("The PC bridge is out of date: restart ryoku-link on the computer")
-                link.cast(pkg)
-                // The computer waits up to ~25 s for scrcpy to open its window.
-                if (!waitFor(45_000) { link.castReply != null }) return@thread say("The computer did not answer")
-                val reply = link.castReply!!
-                say(if (reply.workspace != null) "Sent to the PC, desktop ${reply.workspace}" else "Could not send: ${reply.error}")
+                PcHandoff.hold(applicationContext)
+                val url = try {
+                    readShareLink()
+                } catch (e: ShareWalkFailed) {
+                    PcHandoff.resume(applicationContext)
+                    return@thread say("Could not read the video link (${e.message}): open Share in YouTube and pick Send to PC")
+                }
+                PcHandoff.deliver(applicationContext, url)
             } finally {
-                link.stop()
                 sending = false
             }
         }
     }
 
-    private fun waitFor(timeoutMs: Long, condition: () -> Boolean): Boolean {
-        val deadline = System.nanoTime() + timeoutMs * 1_000_000
-        while (!condition()) {
-            if (System.nanoTime() >= deadline) return false
-            Thread.sleep(100)
-        }
-        return true
+    /** A step of the share-sheet walk that found nothing; the message says which, for the person to see. */
+    private class ShareWalkFailed(message: String) : Exception(message)
+
+    /**
+     * YouTube's Share button opens its own sheet; the last entry of the app row there ("More") opens
+     * Android's chooser, whose header shows the link as text. The sheet is closed again afterwards.
+     * Throws [ShareWalkFailed] when a step is not found (another language for Share, a player without the button).
+     */
+    private fun readShareLink(): String {
+        val share = awaitNode { root -> root.descendants().firstOrNull { it.contentDescription?.toString()?.lowercase() in SHARE_LABELS } }
+            ?: throw ShareWalkFailed("no Share button")
+        if (!tap(share)) throw ShareWalkFailed("Share button would not click")
+        val row = awaitNode { root -> root.descendants().filter { it.isScrollable && it.childCount > 1 }.minByOrNull { it.area() } }
+            ?: throw ShareWalkFailed("no app row")
+        // The row only builds the entries on screen: scroll to its end, where "More" is the last one.
+        var guard = 0
+        while (row.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) && guard++ < 20) { Thread.sleep(350); row.refresh() }
+        // RecyclerView keeps recycled entries among its children: the one furthest right on screen is "More".
+        val more = (0 until row.childCount).mapNotNull { row.getChild(it)?.let(::clickableIn) }
+            .filter { it.isVisibleToUser }.maxByOrNull { Rect().also(it::getBoundsInScreen).left }
+            ?: throw ShareWalkFailed("no clickable entry in the app row (${row.childCount} children, scrolled $guard times)")
+        if (!more.performAction(AccessibilityNodeInfo.ACTION_CLICK)) throw ShareWalkFailed("More would not click (${more.className} ${more.contentDescription})")
+        val text = awaitNode { root -> root.descendants().firstOrNull { it.text?.let(SHARED_LINK::matches) == true } }?.text?.toString()
+            ?: throw ShareWalkFailed("no link in the chooser")
+        // Close the chooser, then YouTube's own sheet when it is still up (a second BACK would leave the app).
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        Thread.sleep(600)
+        if (rootInActiveWindow?.descendants()?.any { it.viewIdResourceName?.endsWith(":id/bottom_sheet_list") == true } == true) performGlobalAction(GLOBAL_ACTION_BACK)
+        return text
     }
+
+    /** The first non-null `find` over the window in front, retried for a few seconds while the screen settles. */
+    private fun awaitNode(find: (AccessibilityNodeInfo) -> AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        var found: AccessibilityNodeInfo? = null
+        PcHandoff.waitFor(5_000) { found = rootInActiveWindow?.let(find); found != null }
+        return found
+    }
+
+    /** The node itself or the first node inside it that can be clicked (a list entry's wrapper is not). */
+    private fun clickableIn(node: AccessibilityNodeInfo): AccessibilityNodeInfo? =
+        (sequenceOf(node) + node.descendants()).firstOrNull { it.isClickable }
+
+    /** Clicks the node, or the closest ancestor that can be clicked. */
+    private fun tap(node: AccessibilityNodeInfo): Boolean {
+        var at: AccessibilityNodeInfo? = node
+        while (at != null && !at.isClickable) at = at.parent
+        return at?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
+    }
+
+    private fun AccessibilityNodeInfo.descendants(): Sequence<AccessibilityNodeInfo> = sequence {
+        for (i in 0 until childCount) { val child = getChild(i) ?: continue; yield(child); yieldAll(child.descendants()) }
+    }
+
+    private fun AccessibilityNodeInfo.area(): Int = Rect().also { getBoundsInScreen(it) }.let { it.width() * it.height() }
 
     /**
      * A line over every app for a few seconds. A Toast is not used: Android drops the toasts of an app
@@ -245,7 +282,13 @@ class CastService : AccessibilityService() {
 
     private companion object {
         const val NOTICE_MS = 5_000L
-        // Apps that may be sent for now; the bridge enforces the same list (CASTABLE_PACKAGES in pc/ryoku_link.py).
-        val CASTABLE = setOf("com.google.android.youtube")
+        // Apps that may be sent for now: YouTube, whose links the bridge opens (see PcHandoff).
+        val CASTABLE = setOf(PcHandoff.YOUTUBE)
+        // YouTube labels its Share button in the phone's language. A language missing here makes the button
+        // answer with how to share by hand; add the label to support it.
+        // The chooser's header shows exactly the shared link; the bridge checks it again.
+        val SHARED_LINK = Regex("https?://(www\\.|m\\.)?(youtube\\.com|youtu\\.be)/\\S+")
+        val SHARE_LABELS = setOf("share", "compartir", "partager", "teilen", "condividi", "compartilhar", "partilhar",
+            "поделиться", "共有", "分享", "공유", "delen", "paylaş", "udostępnij", "dela")
     }
 }

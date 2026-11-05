@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Only window changes: the service learns which app is in front, nothing it shows. Window retrieval is
-     only for telling the phone's screen from a virtual display (the cast): no window content is read.
+<!-- Window changes tell the service which app is in front. Window content is read in one place, when the
+     button is tapped: YouTube's share sheet, for the video's link (see CastService); view ids are needed to
+     tell that sheet from the page under it.
      No touch exploration and no gestures: those turn every single tap into explore-by-touch. -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagRetrieveInteractiveWindows"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds"
     android:canRetrieveWindowContent="true"
     android:notificationTimeout="100"
     android:description="@string/cast_service_description" />
